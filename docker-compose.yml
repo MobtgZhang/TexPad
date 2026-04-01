@@ -1,0 +1,68 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: texpad
+      POSTGRES_PASSWORD: texpad
+      POSTGRES_DB: texpad
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U texpad -d texpad"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio_secret_change_me
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+
+  # TeX compiler worker (used by backend via docker exec or API — see backend compile service)
+  texlive:
+    build:
+      context: ./deploy/texlive
+      dockerfile: Dockerfile
+    image: texpad-texlive:local
+    profiles:
+      - compile
+    # Keep container running for `docker compose run` one-off compiles; not started by default
+    command: ["sleep", "infinity"]
+    volumes:
+      - texwork:/work
+
+  collab:
+    build:
+      context: ./services/collab
+      dockerfile: Dockerfile
+    ports:
+      - "1234:1234"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "1234"
+    profiles:
+      - collab
+
+volumes:
+  pgdata:
+  miniodata:
+  texwork:
