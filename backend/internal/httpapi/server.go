@@ -5,17 +5,20 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/mobtgzhang/TexPad/backend/internal/agent"
 	"github.com/mobtgzhang/TexPad/backend/internal/auth"
 	"github.com/mobtgzhang/TexPad/backend/internal/compile"
 	"github.com/mobtgzhang/TexPad/backend/internal/config"
+	"github.com/mobtgzhang/TexPad/backend/internal/paperclaw"
 	"github.com/mobtgzhang/TexPad/backend/internal/ratelimit"
 	"github.com/mobtgzhang/TexPad/backend/internal/storage"
 )
@@ -26,23 +29,25 @@ type Server struct {
 	pool   *pgxpool.Pool
 	rdb    *redis.Client
 	store  *storage.Client
-	comp   *compile.Manager
-	agent  *agent.Service
+	comp      *compile.Manager
+	paperclaw *paperclaw.Manager
+	agent     *agent.Service
 	rl     *ratelimit.Redis
 	notify *compileNotifier
 }
 
-func New(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool, rdb *redis.Client, store *storage.Client, comp *compile.Manager, ag *agent.Service) *Server {
+func New(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool, rdb *redis.Client, store *storage.Client, comp *compile.Manager, pc *paperclaw.Manager, ag *agent.Service) *Server {
 	return &Server{
-		cfg:    cfg,
-		log:    log,
-		pool:   pool,
-		rdb:    rdb,
-		store:  store,
-		comp:   comp,
-		agent:  ag,
-		rl:     ratelimit.New(rdb),
-		notify: newCompileNotifier(),
+		cfg:       cfg,
+		log:       log,
+		pool:      pool,
+		rdb:       rdb,
+		store:     store,
+		comp:      comp,
+		paperclaw: pc,
+		agent:     ag,
+		rl:        ratelimit.New(rdb),
+		notify:    newCompileNotifier(),
 	}
 }
 
@@ -79,6 +84,8 @@ func (s *Server) Router() http.Handler {
 			r.Use(s.authMiddleware)
 			r.Get("/me", s.handleMe)
 			r.Get("/projects", s.handleListProjects)
+			r.Post("/projects/import/zip", s.handleImportProjectZip)
+			r.Post("/projects/import/github", s.handleImportProjectGitHub)
 			r.Post("/projects", s.handleCreateProject)
 			r.Route("/projects/{projectID}", func(r chi.Router) {
 				r.Use(s.projectAccessMiddleware)
@@ -94,18 +101,42 @@ func (s *Server) Router() http.Handler {
 
 				r.Post("/compile", s.handleCompile)
 				r.Get("/compile/jobs/{jobID}", s.handleCompileJob)
-				r.Get("/pdf/{jobID}", s.handlePDFPresign)
+
+				r.Post("/paperclaw/jobs", s.handlePaperclawCreateJob)
+				r.Get("/paperclaw/jobs/{jobID}", s.handlePaperclawJob)
+				r.Get("/pdf/latest/download", s.handleLatestPDFDownload)
 				r.Get("/pdf/{jobID}/download", s.handlePDFDownload)
+				r.Post("/duplicate", s.handleDuplicateProject)
+				r.Post("/trash", s.handleTrashProject)
+				r.Post("/restore", s.handleRestoreProject)
+				r.Post("/archive", s.handleArchiveProject)
+				r.Post("/unarchive", s.handleUnarchiveProject)
+				r.Get("/pdf/{jobID}/synctex", s.handleSynctexDownload)
+				r.Get("/pdf/{jobID}", s.handlePDFPresign)
 				r.Get("/ws", s.handleCompileWS)
 
+				r.Get("/collab/state", s.handleCollabGetState)
+				r.Put("/collab/state", s.handleCollabPutState)
+
+				r.Get("/comments", s.handleListComments)
+				r.Post("/comments", s.handleCreateComment)
+
+				r.Get("/shares", s.handleListShares)
+				r.Delete("/shares/{token}", s.handleRevokeShare)
+
 				r.Post("/shares", s.handleCreateShare)
+				r.Get("/members", s.handleListProjectMembers)
+				r.Post("/members", s.handleAddProjectMember)
+				r.Delete("/members/{userID}", s.handleRemoveProjectMember)
 				r.Get("/snapshots", s.handleListSnapshots)
 				r.Post("/snapshots", s.handleCreateSnapshot)
+				r.Delete("/snapshots/{snapshotID}", s.handleDeleteSnapshot)
 				r.Post("/snapshots/{snapshotID}/restore", s.handleRestoreSnapshot)
 				r.Get("/export.zip", s.handleExportZip)
 				r.Post("/import.zip", s.handleImportZip)
 
 				r.Post("/agent/stream", s.handleAgentStream)
+				r.Post("/agent/models", s.handleAgentListModels)
 				r.Get("/agent/suggest", s.handleAgentSuggest)
 				r.Get("/agent/papers", s.handleAgentPapers)
 			})
@@ -183,8 +214,12 @@ func (s *Server) PublishCompileDone(projectID, jobID uuid.UUID) {
 
 func (s *Server) projectRole(ctx context.Context, userID, projectID uuid.UUID) (string, error) {
 	var owner uuid.UUID
-	if err := s.pool.QueryRow(ctx, `SELECT owner_id FROM projects WHERE id=$1`, projectID).Scan(&owner); err != nil {
+	var deletedAt *time.Time
+	if err := s.pool.QueryRow(ctx, `SELECT owner_id, deleted_at FROM projects WHERE id=$1`, projectID).Scan(&owner, &deletedAt); err != nil {
 		return "", err
+	}
+	if deletedAt != nil && owner != userID {
+		return "", pgx.ErrNoRows
 	}
 	if owner == userID {
 		return "owner", nil

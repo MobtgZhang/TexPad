@@ -82,8 +82,21 @@ func ArtifactPDFKey(projectID, jobID uuid.UUID) string {
 	return fmt.Sprintf("projects/%s/artifacts/%s/output.pdf", projectID.String(), jobID.String())
 }
 
+func ArtifactSynctexKey(projectID, jobID uuid.UUID) string {
+	return fmt.Sprintf("projects/%s/artifacts/%s/output.synctex.gz", projectID.String(), jobID.String())
+}
+
 func (c *Client) PutArtifact(ctx context.Context, objectKey string, r io.Reader, size int64) error {
 	_, err := c.inner.PutObject(ctx, c.bucket, objectKey, r, size, minio.PutObjectOptions{ContentType: "application/pdf"})
+	return err
+}
+
+func (c *Client) PutArtifactTyped(ctx context.Context, objectKey string, r io.Reader, size int64, contentType string) error {
+	opts := minio.PutObjectOptions{}
+	if contentType != "" {
+		opts.ContentType = contentType
+	}
+	_, err := c.inner.PutObject(ctx, c.bucket, objectKey, r, size, opts)
 	return err
 }
 
@@ -96,4 +109,19 @@ func (c *Client) CopyObject(ctx context.Context, srcKey, dstKey string) error {
 	dst := minio.CopyDestOptions{Bucket: c.bucket, Object: dstKey}
 	_, err := c.inner.CopyObject(ctx, dst, src)
 	return err
+}
+
+// RemoveSnapshotTree deletes all objects under projects/{projectID}/snapshots/{snapshotID}/.
+func (c *Client) RemoveSnapshotTree(ctx context.Context, projectID, snapshotID uuid.UUID) error {
+	prefix := fmt.Sprintf("projects/%s/snapshots/%s/", projectID.String(), snapshotID.String())
+	opts := minio.ListObjectsOptions{Prefix: prefix, Recursive: true}
+	for obj := range c.inner.ListObjects(ctx, c.bucket, opts) {
+		if obj.Err != nil {
+			return obj.Err
+		}
+		if err := c.inner.RemoveObject(ctx, c.bucket, obj.Key, minio.RemoveObjectOptions{}); err != nil {
+			return err
+		}
+	}
+	return nil
 }

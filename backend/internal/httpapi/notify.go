@@ -16,7 +16,7 @@ func newCompileNotifier() *compileNotifier {
 }
 
 func (n *compileNotifier) subscribe(projectID uuid.UUID) chan uuid.UUID {
-	ch := make(chan uuid.UUID, 4)
+	ch := make(chan uuid.UUID, 64)
 	n.mu.Lock()
 	n.subs[projectID] = append(n.subs[projectID], ch)
 	n.mu.Unlock()
@@ -48,6 +48,8 @@ func (n *compileNotifier) publish(projectID, jobID uuid.UUID) {
 		select {
 		case ch <- jobID:
 		default:
+			// 缓冲区满时非阻塞会丢消息，导致前端过早 finalize 而任务行尚未可读；异步补投一次
+			go func(c chan uuid.UUID, id uuid.UUID) { c <- id }(ch, jobID)
 		}
 	}
 }

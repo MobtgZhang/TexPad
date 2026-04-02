@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -83,9 +84,14 @@ func (s *Server) handleShareGetFile(w http.ResponseWriter, r *http.Request) {
 	token := chi.URLParam(r, "token")
 	var pid uuid.UUID
 	var role string
-	err := s.pool.QueryRow(ctx, `SELECT project_id, role FROM project_shares WHERE token=$1`, token).Scan(&pid, &role)
+	var exp *time.Time
+	err := s.pool.QueryRow(ctx, `SELECT project_id, role, expires_at FROM project_shares WHERE token=$1`, token).Scan(&pid, &role, &exp)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "invalid share")
+		return
+	}
+	if exp != nil && time.Now().After(*exp) {
+		writeError(w, http.StatusGone, "share expired")
 		return
 	}
 	_ = role

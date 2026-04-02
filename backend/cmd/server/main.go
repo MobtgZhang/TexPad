@@ -17,6 +17,7 @@ import (
 	"github.com/mobtgzhang/TexPad/backend/internal/config"
 	"github.com/mobtgzhang/TexPad/backend/internal/db"
 	"github.com/mobtgzhang/TexPad/backend/internal/httpapi"
+	"github.com/mobtgzhang/TexPad/backend/internal/paperclaw"
 	"github.com/mobtgzhang/TexPad/backend/internal/storage"
 )
 
@@ -52,9 +53,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	comp := compile.NewManager(pool, st, cfg.DockerBin, cfg.TexliveImage, 4, rdb, log, cfg.CompileNative)
-	ag := agent.New(cfg, pool)
-	srv := httpapi.New(cfg, log, pool, rdb, st, comp, ag)
+	img2024 := cfg.TexliveImage2024
+	if img2024 == "" {
+		img2024 = cfg.TexliveImage
+	}
+	img2025 := cfg.TexliveImage2025
+	if img2025 == "" {
+		img2025 = cfg.TexliveImage
+	}
+	to := time.Duration(cfg.CompileTimeoutSec) * time.Second
+	if cfg.CompileTimeoutSec <= 0 {
+		to = 10 * time.Minute
+	}
+	comp := compile.NewManager(pool, st, cfg.DockerBin, cfg.TexliveImage, img2024, img2025, 4, rdb, log, cfg.CompileNative, compile.RuntimeOpts{
+		CompileTimeout:      to,
+		DockerMemory:        cfg.CompileDockerMemory,
+		CompileDockerVolume: cfg.CompileDockerVolume,
+		CompileWorkspaceDir: cfg.CompileWorkspaceDir,
+	})
+	pc := paperclaw.NewManager(pool, log, 2)
+	ag := agent.New(cfg, pool, rdb)
+	srv := httpapi.New(cfg, log, pool, rdb, st, comp, pc, ag)
 
 	comp.OnFinish = func(projectID, jobID uuid.UUID) {
 		srv.PublishCompileDone(projectID, jobID)
@@ -63,6 +82,7 @@ func main() {
 	ctxWorkers, cancelWorkers := context.WithCancel(context.Background())
 	defer cancelWorkers()
 	go comp.Start(ctxWorkers)
+	go pc.Start(ctxWorkers)
 
 	h := srv.Router()
 	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: h, ReadHeaderTimeout: 10 * time.Second}

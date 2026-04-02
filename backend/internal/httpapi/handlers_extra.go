@@ -5,18 +5,24 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/mobtgzhang/TexPad/backend/internal/agent"
 	"github.com/mobtgzhang/TexPad/backend/internal/parse"
 	"github.com/mobtgzhang/TexPad/backend/internal/storage"
 )
 
 type createShareReq struct {
-	Role string `json:"role"`
+	Role           string `json:"role"`
+	ExpiresInHours *int   `json:"expires_in_hours"`
 }
 
 func (s *Server) handleCreateShare(w http.ResponseWriter, r *http.Request) {
@@ -36,12 +42,81 @@ func (s *Server) handleCreateShare(w http.ResponseWriter, r *http.Request) {
 		role = "viewer"
 	}
 	tok := uuid.NewString()
-	_, err := s.pool.Exec(ctx, `INSERT INTO project_shares (token, project_id, role) VALUES ($1,$2,$3)`, tok, pid, role)
+	var exp any
+	if req.ExpiresInHours != nil && *req.ExpiresInHours > 0 && *req.ExpiresInHours <= 24*365 {
+		t := time.Now().Add(time.Duration(*req.ExpiresInHours) * time.Hour)
+		exp = t
+	}
+	if exp != nil {
+		_, err := s.pool.Exec(ctx, `INSERT INTO project_shares (token, project_id, role, expires_at) VALUES ($1,$2,$3,$4)`, tok, pid, role, exp)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "db error")
+			return
+		}
+	} else {
+		_, err := s.pool.Exec(ctx, `INSERT INTO project_shares (token, project_id, role) VALUES ($1,$2,$3)`, tok, pid, role)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "db error")
+			return
+		}
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"token": tok, "role": role})
+}
+
+func (s *Server) handleListShares(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if projectRoleFrom(ctx) != "owner" {
+		writeError(w, http.StatusForbidden, "owner only")
+		return
+	}
+	pid := projectIDFrom(ctx)
+	rows, err := s.pool.Query(ctx, `SELECT token, role, created_at, expires_at FROM project_shares WHERE project_id=$1 ORDER BY created_at DESC`, pid)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "db error")
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"token": tok, "role": role})
+	defer rows.Close()
+	var list []map[string]any
+	for rows.Next() {
+		var tok, role string
+		var created time.Time
+		var exp *time.Time
+		if err := rows.Scan(&tok, &role, &created, &exp); err != nil {
+			writeError(w, http.StatusInternalServerError, "scan")
+			return
+		}
+		item := map[string]any{"token": tok, "role": role, "created_at": created}
+		if exp != nil {
+			item["expires_at"] = *exp
+		}
+		list = append(list, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"shares": list})
+}
+
+func (s *Server) handleRevokeShare(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if projectRoleFrom(ctx) != "owner" {
+		writeError(w, http.StatusForbidden, "owner only")
+		return
+	}
+	pid := projectIDFrom(ctx)
+	tok := strings.TrimSpace(chi.URLParam(r, "token"))
+	if tok == "" {
+		writeError(w, http.StatusBadRequest, "missing token")
+		return
+	}
+	var deleted string
+	err := s.pool.QueryRow(ctx, `DELETE FROM project_shares WHERE project_id=$1 AND token=$2 RETURNING token`, pid, tok).Scan(&deleted)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type snapshotReq struct {
@@ -120,6 +195,33 @@ func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
 		list = append(list, map[string]any{"id": id.String(), "label": l, "created_at": ts})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": list})
+}
+
+func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if projectRoleFrom(ctx) == "viewer" {
+		writeError(w, http.StatusForbidden, "read only")
+		return
+	}
+	pid := projectIDFrom(ctx)
+	sid, err := uuid.Parse(chi.URLParam(r, "snapshotID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad id")
+		return
+	}
+	tag, err := s.pool.Exec(ctx, `DELETE FROM project_snapshots WHERE id=$1 AND project_id=$2`, sid, pid)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if err := s.store.RemoveSnapshotTree(ctx, pid, sid); err != nil {
+		s.log.Warn("snapshot storage cleanup", "err", err)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleRestoreSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -284,7 +386,15 @@ func (s *Server) handleImportZip(w http.ResponseWriter, r *http.Request) {
 }
 
 type agentStreamReq struct {
-	Messages []map[string]string `json:"messages"`
+	Messages     []map[string]string `json:"messages"`
+	Images       []agent.ImagePart   `json:"images"`
+	LLMBaseURL   string              `json:"llm_base_url"`
+	LLMAPIKey    string              `json:"llm_api_key"`
+	Model        string              `json:"model"`
+	Temperature  *float64            `json:"temperature"`
+	TopP         *float64            `json:"top_p"`
+	TopK         *float64            `json:"top_k"`
+	MaxToolSteps *int                `json:"max_tool_steps"`
 }
 
 func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
@@ -307,7 +417,239 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 	if ok {
 		fl.Flush()
 	}
-	_ = s.agent.StreamChat(ctx, uid, pid, req.Messages, w)
+
+	var plan, sum strings.Builder
+	env := &agent.ToolEnv{
+		Ctx:       ctx,
+		ProjectID: pid.String(),
+		PlanBuf:   &plan,
+		SumBuf:    &sum,
+		ReadFile: func(c context.Context, rel string) ([]byte, error) {
+			p, ok := sanitizeRelPath(rel)
+			if !ok {
+				return nil, fmt.Errorf("invalid path")
+			}
+			obj, err := s.store.GetFile(c, pid, p)
+			if err != nil {
+				return nil, err
+			}
+			defer obj.Close()
+			return io.ReadAll(obj)
+		},
+		WriteFile: func(c context.Context, rel string, data []byte) error {
+			if projectRoleFrom(c) == "viewer" {
+				return fmt.Errorf("read only")
+			}
+			p, ok := sanitizeRelPath(rel)
+			if !ok {
+				return fmt.Errorf("invalid path")
+			}
+			return s.putBytesFile(c, pid, p, data)
+		},
+		ReadBib: func(c context.Context) ([]byte, error) {
+			rows, err := s.pool.Query(c, `SELECT path FROM project_files WHERE project_id=$1 AND lower(path) LIKE '%.bib' ORDER BY path LIMIT 4`, pid)
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+			var merged strings.Builder
+			for rows.Next() {
+				var p string
+				if rows.Scan(&p) != nil {
+					continue
+				}
+				obj, err := s.store.GetFile(c, pid, p)
+				if err != nil {
+					continue
+				}
+				b, err := io.ReadAll(obj)
+				_ = obj.Close()
+				if err != nil {
+					continue
+				}
+				merged.WriteString("\n% --- ")
+				merged.WriteString(p)
+				merged.WriteString("\n")
+				merged.Write(b)
+			}
+			return []byte(merged.String()), nil
+		},
+	}
+	ov := &agent.LLMOverrides{
+		BaseURL:      req.LLMBaseURL,
+		APIKey:       req.LLMAPIKey,
+		Model:        req.Model,
+		Temperature:  req.Temperature,
+		TopP:         req.TopP,
+		TopK:         req.TopK,
+		MaxToolSteps: req.MaxToolSteps,
+	}
+	_ = s.agent.RunAgentPipeline(ctx, uid, pid, req.Messages, req.Images, env, w, ov)
+}
+
+type agentModelsReq struct {
+	LLMBaseURL string `json:"llm_base_url"`
+	LLMAPIKey  string `json:"llm_api_key"`
+}
+
+// openAICompatibleModelsURL 避免 base 已含 /v1 时再拼成 /v1/v1/models（会 404）。
+func openAICompatibleModelsURL(base string) string {
+	b := strings.TrimRight(strings.TrimSpace(base), "/")
+	if b == "" {
+		return ""
+	}
+	if strings.HasSuffix(b, "/v1") {
+		return b + "/models"
+	}
+	return b + "/v1/models"
+}
+
+// ollamaTagsURL 将服务根与 Ollama 的 GET /api/tags 对齐（去掉末尾的 /v1）。
+func ollamaTagsURL(base string) string {
+	b := strings.TrimRight(strings.TrimSpace(base), "/")
+	if b == "" {
+		return ""
+	}
+	b = strings.TrimSuffix(b, "/v1")
+	return b + "/api/tags"
+}
+
+func parseOpenAIModelsJSON(raw []byte) []string {
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(raw, &parsed) != nil || len(parsed.Data) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(parsed.Data))
+	for _, d := range parsed.Data {
+		if t := strings.TrimSpace(d.ID); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func parseOllamaTagsJSON(raw []byte) []string {
+	var parsed struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if json.Unmarshal(raw, &parsed) != nil {
+		return nil
+	}
+	out := make([]string, 0, len(parsed.Models))
+	for _, m := range parsed.Models {
+		if t := strings.TrimSpace(m.Name); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func (s *Server) handleAgentListModels(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if projectRoleFrom(ctx) == "viewer" {
+		writeError(w, http.StatusForbidden, "read only")
+		return
+	}
+	var req agentModelsReq
+	_ = readJSON(r, &req)
+	base := strings.TrimRight(strings.TrimSpace(req.LLMBaseURL), "/")
+	key := strings.TrimSpace(req.LLMAPIKey)
+	if base == "" {
+		base = strings.TrimRight(strings.TrimSpace(s.cfg.LLMBaseURL), "/")
+	}
+	if key == "" {
+		key = strings.TrimSpace(s.cfg.LLMAPIKey)
+	}
+	if base == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []string{}})
+		return
+	}
+
+	client := &http.Client{Timeout: 25 * time.Second}
+	openURL := openAICompatibleModelsURL(base)
+	ollamaURL := ollamaTagsURL(base)
+
+	tryOllama := false
+	openHint := ""
+
+	if key != "" && openURL != "" {
+		hreq, err := http.NewRequestWithContext(ctx, http.MethodGet, openURL, nil)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad request")
+			return
+		}
+		hreq.Header.Set("Authorization", "Bearer "+key)
+		resp, err := client.Do(hreq)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"models": []string{}, "error": err.Error()})
+			return
+		}
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		resp.Body.Close()
+		switch resp.StatusCode {
+		case http.StatusOK:
+			if models := parseOpenAIModelsJSON(raw); len(models) > 0 {
+				writeJSON(w, http.StatusOK, map[string]any{"models": models})
+				return
+			}
+			tryOllama = true
+			openHint = fmt.Sprintf("%s 返回空列表", openURL)
+		case http.StatusNotFound:
+			tryOllama = true
+			openHint = fmt.Sprintf("%s 返回 404（可检查 Base URL 是否多写了 /v1）", openURL)
+		default:
+			writeJSON(w, http.StatusOK, map[string]any{
+				"models": []string{},
+				"error":  fmt.Sprintf("%s 返回 HTTP %d", openURL, resp.StatusCode),
+			})
+			return
+		}
+	} else {
+		// 未配置 API Key 时仍尝试 Ollama（本地常见无需密钥）
+		tryOllama = true
+	}
+
+	if tryOllama && ollamaURL != "" {
+		hreq2, err := http.NewRequestWithContext(ctx, http.MethodGet, ollamaURL, nil)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad request")
+			return
+		}
+		if key != "" {
+			hreq2.Header.Set("Authorization", "Bearer "+key)
+		}
+		resp2, err := client.Do(hreq2)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"models": []string{}, "error": err.Error()})
+			return
+		}
+		raw2, _ := io.ReadAll(io.LimitReader(resp2.Body, 2<<20))
+		resp2.Body.Close()
+		if resp2.StatusCode == http.StatusOK {
+			if models := parseOllamaTagsJSON(raw2); len(models) > 0 {
+				writeJSON(w, http.StatusOK, map[string]any{"models": models})
+				return
+			}
+		}
+		msg := fmt.Sprintf("%s 返回 HTTP %d", ollamaURL, resp2.StatusCode)
+		if openHint != "" {
+			msg = openHint + "；" + msg
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"models": []string{}, "error": msg})
+		return
+	}
+
+	if openHint != "" {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []string{}, "error": openHint})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"models": []string{}})
 }
 
 func (s *Server) handleAgentSuggest(w http.ResponseWriter, r *http.Request) {
