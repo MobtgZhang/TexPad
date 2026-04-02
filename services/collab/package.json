@@ -1,9 +1,14 @@
 {
   "name": "texpad-collab",
   "private": true,
-  "type": "module",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.cjs"
+  },
   "dependencies": {
+    "jsonwebtoken": "^9.0.2",
+    "ws": "^8.18.0",
     "y-websocket": "^2.0.4",
-    "ws": "^8.18.0"
+    "yjs": "^13.6.20"
   }
 }
