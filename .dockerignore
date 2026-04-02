@@ -1,0 +1,8 @@
+.git
+**/node_modules
+bin
+frontend/dist
+ideas
+**/.env
+**/*.log
+.cursor

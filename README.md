@@ -16,7 +16,7 @@ Open-source online LaTeX editor with Go backend: projects, MinIO file storage, c
 | `make run-frontend` | 仅前端 |
 | `make start-deps` | `make up` + `make migrate`（用 Docker 起 PG/Redis/MinIO 并迁移，可选） |
 | `make build` | `build-backend` + `build-frontend` |
-| `make build-docker` | 构建 `texlive` 与 `collab` 镜像（需 `--profile`） |
+| `make build-docker` | 构建 `texlive2024` / `texlive2025` 与 `collab` 镜像（需 `--profile`） |
 | `make up` / `make down` | 启停 Postgres、Redis、MinIO（Docker） |
 | `make migrate` | 数据库迁移 |
 | `make clean` | 删除 `bin/` 与 `frontend/dist` |
@@ -128,19 +128,30 @@ brew install postgresql@16 redis minio
    cd frontend && npm install && npm run dev
    ```
 
-6. Optional — TeX compiler image (large build):
+6. Optional — TeX Live 编译镜像（Island of TeX **`full` 方案**，体积大但宏包齐全；`texlive2025` 默认 `latest-full`，`texlive2024` 为 `TL2024-historic`）：
 
    ```bash
-   docker compose --profile compile build texlive
+   docker compose --profile compile build texlive2024 texlive2025
    ```
 
-7. Optional — Yjs collaboration server（`y-websocket` 独立服务；前端设置 `VITE_COLLAB_WS`）：
+   后端需设置 `TEXPAD_TEXLIVE_IMAGE`、`TEXPAD_TEXLIVE_IMAGE_2024`、`TEXPAD_TEXLIVE_IMAGE_2025`（见 `.env.example`）。**`make run-docker` 会先构建上述镜像**。
+
+7. **`make run-docker` 一键栈**：后端容器内通过挂载 **`/var/run/docker.sock`** 调用宿主 Docker 执行 `docker run … texpad-texlive:*` 编译（与 [Overleaf](https://github.com/overleaf/overleaf) 类似，完整 TeX 在独立镜像中）。仅适用于本机/信任环境；生产请评估安全性或改用独立编译服务。
+
+8. Optional — Yjs collaboration server（`y-websocket` 独立服务；前端设置 `VITE_COLLAB_WS`）：
 
    ```bash
    docker compose --profile collab up -d collab
    ```
 
-8. 内置 LaTeX 模板示例见 [deploy/templates/article.tex](deploy/templates/article.tex)，可复制到项目中使用。
+9. 内置 LaTeX 模板示例见 [deploy/templates/article.tex](deploy/templates/article.tex)，可复制到项目中使用。
+
+## 编译失败排查
+
+- 升级代码后执行 `make migrate`（或 `cd backend && go run ./cmd/migrate`），确保数据库已包含 `compile_jobs.texlive_year` 等迁移。
+- **Docker 编译**（`TEXPAD_COMPILE_NATIVE=false`）：本机需可运行 `docker`，且 `TEXPAD_TEXLIVE_IMAGE` / `_2024` / `_2025` 与本地镜像名一致；**在 Docker Compose 里跑后端时**，还需把 **`/var/run/docker.sock`** 挂进后端容器，并为编译任务配置 **与宿主 `docker run` 共享的命名卷**（`TEXPAD_COMPILE_DOCKER_VOLUME` + `TEXPAD_COMPILE_WORKSPACE_DIR`，本仓库 `docker-compose.yml` 已写为 `texpad_compile_workspace` ↔ `/compile-work`）。若缺少该卷，后端在容器内创建的 `/tmp/...` 与宿主 Docker 挂载路径不一致，会导致 **`build.log` 为空**、界面只剩 `docker run 退出码 11` 与泛化摘要。编辑器底部 **「编译日志」** 面板可查看完整 `log_text`，并可 **「复制全文」**。
+- 若曾出现 `algorithmic.sty not found` 等缺包错误，多半是用了宿主/容器内**精简 TeX**；请改用本仓库构建的 **`texpad-texlive`（`latest-full`）** 或本机安装 `texlive-full`。
+- **大文档或冷启动**可适当提高 `TEXPAD_COMPILE_TIMEOUT_SEC`（默认 600 秒）与 `TEXPAD_COMPILE_DOCKER_MEMORY`（默认 `2048m`），见 [.env.example](.env.example)。
 
 ## API
 

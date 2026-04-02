@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: texpad
       POSTGRES_DB: texpad
     ports:
-      - "5432:5432"
+      - "25432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -18,7 +18,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "26379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -32,20 +32,87 @@ services:
       MINIO_ROOT_USER: minio
       MINIO_ROOT_PASSWORD: minio_secret_change_me
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "19000:9000"
+      - "19001:9001"
     volumes:
       - miniodata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
-  # TeX compiler worker (used by backend via docker exec or API — see backend compile service)
-  texlive:
+  # 一键本地栈：make run-docker（Postgres / Redis / MinIO + 后端 + Nginx 前端）
+  backend:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: deploy/backend/Dockerfile
+    environment:
+      TEXPAD_HTTP_ADDR: ":8080"
+      TEXPAD_DATABASE_URL: postgres://texpad:texpad@postgres:5432/texpad?sslmode=disable
+      TEXPAD_REDIS_ADDR: redis:6379
+      TEXPAD_MINIO_ENDPOINT: minio:9000
+      TEXPAD_MINIO_ACCESS_KEY: minio
+      TEXPAD_MINIO_SECRET_KEY: minio_secret_change_me
+      TEXPAD_MINIO_BUCKET: texpad
+      TEXPAD_MINIO_USE_SSL: "false"
+      TEXPAD_JWT_SECRET: dev-docker-change-me
+      TEXPAD_CORS_ORIGINS: http://localhost:18472
+      # 使用宿主 Docker + texpad-texlive:2025（TeX Live full），避免容器内 Debian 精简 TeX 缺宏包
+      TEXPAD_COMPILE_NATIVE: "false"
+      TEXPAD_TEXLIVE_IMAGE: texpad-texlive:2025
+      TEXPAD_TEXLIVE_IMAGE_2025: texpad-texlive:2025
+      TEXPAD_TEXLIVE_IMAGE_2024: texpad-texlive:2024
+      TEXPAD_DOCKER_BIN: /usr/bin/docker
+      # 与下方命名卷一致：宿主 docker run 挂载的是「卷」而非容器内 /tmp，否则读不到 build.log
+      TEXPAD_COMPILE_DOCKER_VOLUME: texpad_compile_workspace
+      TEXPAD_COMPILE_WORKSPACE_DIR: /compile-work
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - texpad_compile_workspace:/compile-work
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  web:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: deploy/web/Dockerfile
+    ports:
+      - "18472:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # TeX 编译镜像（huge）；后端通过 `docker run` 使用，需设置 TEXPAD_TEXLIVE_IMAGE / _2024 / _2025
+  texlive2025:
     build:
       context: ./deploy/texlive
       dockerfile: Dockerfile
-    image: texpad-texlive:local
+      args:
+        TEX_SCHEME: latest-full
+    image: texpad-texlive:2025
     profiles:
       - compile
-    # Keep container running for `docker compose run` one-off compiles; not started by default
+    command: ["sleep", "infinity"]
+    volumes:
+      - texwork:/work
+
+  texlive2024:
+    build:
+      context: ./deploy/texlive
+      dockerfile: Dockerfile
+      args:
+        TEX_SCHEME: TL2024-historic
+    image: texpad-texlive:2024
+    profiles:
+      - compile
     command: ["sleep", "infinity"]
     volumes:
       - texwork:/work
@@ -55,10 +122,12 @@ services:
       context: ./services/collab
       dockerfile: Dockerfile
     ports:
-      - "1234:1234"
+      - "18475:18475"
     environment:
       HOST: "0.0.0.0"
-      PORT: "1234"
+      PORT: "18475"
+      TEXPAD_JWT_SECRET: dev-docker-change-me
+      TEXPAD_API_URL: http://backend:8080
     profiles:
       - collab
 
@@ -66,3 +135,5 @@ volumes:
   pgdata:
   miniodata:
   texwork:
+  texpad_compile_workspace:
+    name: texpad_compile_workspace
