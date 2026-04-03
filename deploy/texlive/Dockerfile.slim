@@ -1,9 +1,7 @@
-# TeX Live「full」方案：与 Island of TeX 上游一致，含几乎全部 CTAN 宏包（含 algorithms / algorithmic、会议稿模板等）。
-# 上游说明：https://gitlab.com/islandoftex/images/texlive（scheme `full` ≈ 完整安装，无文档树以减小体积）
-# 构建参数 TEX_SCHEME：
-#   - latest-full：当前 TeX Live 周构建（推荐本地开发）
-#   - TL2024-historic 等：锁定历史发行版（见上游 Registry）
-ARG TEX_SCHEME=latest-full
+# TeX Live medium 方案：用于 CI 或磁盘紧张环境；宏包少于 full，复杂文档可能缺包。
+# 上游：https://gitlab.com/islandoftex/images/texlive
+# 上游 tag 为 latest-medium（非裸 medium），与 compose build args 一致
+ARG TEX_SCHEME=latest-medium
 FROM registry.gitlab.com/islandoftex/images/texlive:${TEX_SCHEME}
 
 USER root
@@ -11,6 +9,10 @@ RUN apt-get update \
 	&& DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends fonts-noto-cjk \
 	&& rm -rf /var/lib/apt/lists/* \
 	&& fc-cache -fv
+
+# medium 方案常缺 LaTeX/ConTeXt 中文相关集合，按需安装（体积会增大）
+RUN tlmgr update --self \
+	&& tlmgr install collection-langcjk collection-context
 
 WORKDIR /work
 ENV PATH="/usr/local/bin:/usr/bin:${PATH}"
