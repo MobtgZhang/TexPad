@@ -2949,6 +2949,17 @@ html[data-theme='light'] .editor-recompile-pop__row:hover:not(:disabled) {
   font-size: 0.85rem;
 }
 
+.editor-ft-ul--drop {
+  outline: 1px dashed var(--texpad-accent, #3b82f6);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.editor-ft-dir--drop {
+  background: color-mix(in srgb, var(--texpad-accent, #3b82f6) 12%, transparent);
+  border-radius: 4px;
+}
+
 .editor-filetree-list {
   list-style: none;
   margin: 0;

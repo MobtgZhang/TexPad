@@ -1,5 +1,15 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
+
+const DND_INTERNAL_PATH = 'application/x-texpad-path'
+
+function dataTransferHasFiles(dt: DataTransfer): boolean {
+  return [...dt.types].includes('Files')
+}
+
+function dataTransferIsDroppable(dt: DataTransfer): boolean {
+  return dataTransferHasFiles(dt) || [...dt.types].includes(DND_INTERNAL_PATH)
+}
 
 export type FileEnt = { path: string; size_bytes?: number }
 
@@ -115,10 +125,13 @@ export default function FileTree(props: {
   onNewFile: (name: string) => void
   onNewFolder: (folderPrefix: string) => void
   onDelete: (path: string) => void
+  onDeleteFolder?: (folderPrefix: string) => void
   onSetMain: (path: string) => void
   onRenameFile: (path: string) => void
   onDownloadFile: (path: string) => void
   onImportZipClick: () => void
+  onUploadDropped?: (folderPrefix: string, files: FileList) => void
+  onMoveFile?: (fromPath: string, toFolderPrefix: string) => void
 }) {
   const {
     files,
@@ -131,16 +144,20 @@ export default function FileTree(props: {
     onNewFile,
     onNewFolder,
     onDelete,
+    onDeleteFolder,
     onSetMain,
     onRenameFile,
     onDownloadFile,
     onImportZipClick,
+    onUploadDropped,
+    onMoveFile,
   } = props
 
   const tree = useMemo(() => buildTree(files), [files])
   const [openDirs, setOpenDirs] = useState<Set<string>>(() => new Set())
   const [menu, setMenu] = useState<MenuState>(null)
   const menuRef = useRef<HTMLDivElement | null>(null)
+  const [dropHighlightPrefix, setDropHighlightPrefix] = useState<string | null>(null)
 
   useEffect(() => {
     const parts = logicalPathSegments(activePath)
@@ -155,6 +172,12 @@ export default function FileTree(props: {
       return next
     })
   }, [activePath])
+
+  useEffect(() => {
+    const onDragEnd = () => setDropHighlightPrefix(null)
+    window.addEventListener('dragend', onDragEnd)
+    return () => window.removeEventListener('dragend', onDragEnd)
+  }, [])
 
   useEffect(() => {
     if (!menu) return
@@ -216,16 +239,64 @@ export default function FileTree(props: {
     return { x: nx, y: ny }
   }
 
-  function renderLevel(map: Map<string, TreeNode>, prefix: string): ReactNode {
+  function runDrop(e: DragEvent, folderPrefix: string) {
+    if (readOnly) return
+    e.preventDefault()
+    e.stopPropagation()
+    setDropHighlightPrefix(null)
+    const from = e.dataTransfer.getData(DND_INTERNAL_PATH)
+    if (from && onMoveFile) {
+      void onMoveFile(from, folderPrefix)
+      return
+    }
+    if (e.dataTransfer.files?.length && onUploadDropped) {
+      void onUploadDropped(folderPrefix, e.dataTransfer.files)
+    }
+  }
+
+  function onListDragOver(e: DragEvent, folderPrefix: string) {
+    if (readOnly) return
+    e.preventDefault()
+    e.stopPropagation()
+    if (!dataTransferIsDroppable(e.dataTransfer)) return
+    e.dataTransfer.dropEffect = dataTransferHasFiles(e.dataTransfer) ? 'copy' : 'move'
+    setDropHighlightPrefix(folderPrefix)
+  }
+
+  function onDirRowDragOver(e: DragEvent, fullKey: string) {
+    if (readOnly) return
+    e.preventDefault()
+    e.stopPropagation()
+    if (!dataTransferIsDroppable(e.dataTransfer)) return
+    e.dataTransfer.dropEffect = dataTransferHasFiles(e.dataTransfer) ? 'copy' : 'move'
+    setDropHighlightPrefix(fullKey)
+  }
+
+  function renderLevel(map: Map<string, TreeNode>, prefix: string, listDropPrefix: string, ulClass: string): ReactNode {
     const keys = sortedKeys(map)
-    return keys.map((key) => {
+    return (
+      <ul
+        className={`${ulClass}${dropHighlightPrefix === listDropPrefix ? ' editor-ft-ul--drop' : ''}`}
+        onDragOver={(e) => onListDragOver(e, listDropPrefix)}
+        onDrop={(e) => runDrop(e, listDropPrefix)}
+      >
+        {keys.map((key) => {
       const node = map.get(key)!
       const fullKey = prefix ? `${prefix}/${key}` : key
       if (node.kind === 'file') {
         const isActive = sameProjectPath(node.path, activePath)
         const isMain = sameProjectPath(node.path, mainPath)
         return (
-          <li key={node.path} className="editor-ft-row">
+          <li
+            key={node.path}
+            className="editor-ft-row"
+            draggable={!readOnly && Boolean(onMoveFile)}
+            onDragStart={(e) => {
+              if (readOnly || !onMoveFile) return
+              e.dataTransfer.setData(DND_INTERNAL_PATH, node.path)
+              e.dataTransfer.effectAllowed = 'move'
+            }}
+          >
             <button
               type="button"
               className={`editor-ft-file ${isActive ? 'editor-ft-active' : ''}${isMain ? ' editor-ft-file--main' : ''}`}
@@ -264,7 +335,11 @@ export default function FileTree(props: {
       const isOpen = openDirs.has(fullKey)
       return (
         <li key={fullKey} className="editor-ft-dirwrap">
-          <div className="editor-ft-dir">
+          <div
+            className={`editor-ft-dir${dropHighlightPrefix === fullKey ? ' editor-ft-dir--drop' : ''}`}
+            onDragOver={(e) => onDirRowDragOver(e, fullKey)}
+            onDrop={(e) => runDrop(e, fullKey)}
+          >
             <button
               type="button"
               className="editor-ft-chevron"
@@ -303,10 +378,12 @@ export default function FileTree(props: {
               </button>
             )}
           </div>
-          {isOpen && <ul className="editor-ft-nested">{renderLevel(node.children, fullKey)}</ul>}
+          {isOpen ? renderLevel(node.children, fullKey, fullKey, 'editor-ft-nested') : null}
         </li>
       )
-    })
+        })}
+      </ul>
+    )
   }
 
   const menuPos = menu ? clampMenuPosition(menu.x, menu.y) : null
@@ -380,6 +457,22 @@ export default function FileTree(props: {
             <button type="button" className="editor-ft-menu__item" role="menuitem" onClick={() => { onImportZipClick(); setMenu(null) }}>
               上传 zip 导入
             </button>
+            {onDeleteFolder ? (
+              <>
+                <div className="editor-ft-menu__sep" role="separator" />
+                <button
+                  type="button"
+                  className="editor-ft-menu__item editor-ft-menu__item--danger"
+                  role="menuitem"
+                  onClick={() => {
+                    onDeleteFolder(menu.prefix)
+                    setMenu(null)
+                  }}
+                >
+                  删除文件夹
+                </button>
+              </>
+            ) : null}
           </>
         )}
       </div>,
@@ -387,7 +480,14 @@ export default function FileTree(props: {
     )
 
   return (
-    <div className="editor-filetree">
+    <div
+      className="editor-filetree"
+      onDragOver={(e) => {
+        if (readOnly || !panelExpanded) return
+        if (!dataTransferIsDroppable(e.dataTransfer)) return
+        e.preventDefault()
+      }}
+    >
       {menuPortal}
       <div className="editor-filetree-head">
         {onTogglePanel ? (
@@ -417,7 +517,7 @@ export default function FileTree(props: {
           </div>
         )}
       </div>
-      {panelExpanded ? <ul className="editor-filetree-list">{renderLevel(tree, '')}</ul> : null}
+      {panelExpanded ? renderLevel(tree, '', '', 'editor-filetree-list') : null}
     </div>
   )
 }

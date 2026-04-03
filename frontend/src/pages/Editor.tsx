@@ -100,6 +100,17 @@ function encodeProjectFilePathForUrl(rel: string): string {
     .join('/')
 }
 
+function pathBasename(rel: string): string {
+  const a = rel.replace(/\\/g, '/').split('/').filter(Boolean)
+  return a[a.length - 1] || rel
+}
+
+/** 路径是否位于文件夹 prefix 下（含恰好等于 prefix 的占位路径） */
+function pathUnderFolder(filePath: string, folderPrefix: string): boolean {
+  if (!folderPrefix) return false
+  return filePath === folderPrefix || filePath.startsWith(folderPrefix + '/')
+}
+
 function decodeProposalB64(b64: string): string {
   if (!b64) return ''
   try {
@@ -128,6 +139,18 @@ async function putProjectFile(pid: string, p: string, body: string) {
     headers: {
       Authorization: `Bearer ${getToken() || ''}`,
       'Content-Type': 'text/plain; charset=utf-8',
+    },
+    body,
+  })
+  if (!res.ok) throw new Error(await res.text())
+}
+
+async function putProjectFileRaw(pid: string, p: string, body: ArrayBuffer, contentType: string) {
+  const res = await fetch(`${BASE()}/api/v1/projects/${pid}/files/${encodeProjectFilePathForUrl(p)}`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${getToken() || ''}`,
+      'Content-Type': contentType || 'application/octet-stream',
     },
     body,
   })
@@ -1019,6 +1042,27 @@ export default function EditorPage() {
     setOpenTabs((t) => [...new Set([...t, p])])
   }
 
+  async function uploadProjectFilesWithPrefix(folderPrefix: string, fileList: FileList) {
+    if (!projectId || role === 'viewer' || fileList.length === 0) return
+    const prefix = folderPrefix.replace(/\/+$/, '')
+    try {
+      for (let i = 0; i < fileList.length; i++) {
+        const f = fileList.item(i)
+        if (!f) continue
+        const rel = prefix ? `${prefix}/${f.name}` : f.name
+        const fd = new FormData()
+        fd.append('file', f)
+        fd.append('path', rel)
+        await apiForm<{ path: string }>(`/api/v1/projects/${projectId}/files/upload`, fd)
+      }
+      setMsg('上传完成')
+      window.setTimeout(() => setMsg(''), 2500)
+      await loadFiles()
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : '上传失败')
+    }
+  }
+
   function runEditorAction(actionId: string) {
     editorInstRef.current?.getAction(actionId)?.run()
     setTopMenu(null)
@@ -1411,6 +1455,63 @@ export default function EditorPage() {
     await loadFiles()
   }
 
+  async function deleteFolder(folderPrefix: string) {
+    if (!projectId || role === 'viewer') return
+    if (collabOn) {
+      setMsg('协作模式下暂不支持删除文件夹')
+      setTimeout(() => setMsg(''), 3200)
+      return
+    }
+    const pfx = folderPrefix.replace(/\/+$/, '')
+    if (!pfx) return
+    if (!confirm(`删除文件夹「${pfx}」及其下所有文件？`)) return
+    const res = await fetch(
+      `${BASE()}/api/v1/projects/${projectId}/files/${encodeProjectFilePathForUrl(pfx)}?recursive=1`,
+      { method: 'DELETE', headers: { Authorization: `Bearer ${getToken() || ''}` } },
+    )
+    if (!res.ok) {
+      setMsg(await res.text())
+      return
+    }
+    const wasActiveUnder = pathUnderFolder(activePath, pfx)
+    const toDispose: string[] = []
+    modelsRef.current.forEach((_, path) => {
+      if (pathUnderFolder(path, pfx)) toDispose.push(path)
+    })
+    for (const path of toDispose) {
+      modelsRef.current.get(path)?.dispose()
+      modelsRef.current.delete(path)
+    }
+    setOpenTabs((tabs) => tabs.filter((path) => !pathUnderFolder(path, pfx)))
+    await loadFiles()
+    const listed = await api<{ files: FileEnt[] }>(`/api/v1/projects/${projectId}/files`)
+    const nf = listed.files || []
+    let nextMain = mainPath
+    if (!nf.some((f) => f.path === mainPath)) {
+      nextMain = nf.find((f) => /\.tex$/i.test(f.path))?.path || 'main.tex'
+      try {
+        await api(`/api/v1/projects/${projectId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ main_tex_path: nextMain }),
+        })
+        setMainPath(nextMain)
+      } catch (e) {
+        setMsg(e instanceof Error ? e.message : '更新主文档路径失败')
+      }
+    }
+    if (wasActiveUnder) {
+      const nextActive =
+        nf.find((f) => f.path === nextMain)?.path ??
+        nf.find((f) => /\.tex$/i.test(f.path))?.path ??
+        nf[0]?.path ??
+        'main.tex'
+      setActivePath(nextActive)
+    }
+    setMsg('已删除文件夹')
+    window.setTimeout(() => setMsg(''), 2500)
+  }
+
   async function renameActiveFile() {
     if (!projectId || role === 'viewer' || !activePath) return
     if (collabOn) {
@@ -1488,6 +1589,74 @@ export default function EditorPage() {
       setTimeout(() => setMsg(''), 2000)
     } catch (e) {
       setMsg(e instanceof Error ? e.message : '重命名失败')
+    }
+  }
+
+  async function moveProjectFile(fromPath: string, toFolderPrefix: string) {
+    if (!projectId || role === 'viewer' || !fromPath) return
+    if (collabOn) {
+      setMsg('协作模式下暂不支持移动文件')
+      setTimeout(() => setMsg(''), 3200)
+      return
+    }
+    const destDir = toFolderPrefix.replace(/\/+$/, '')
+    const base = pathBasename(fromPath)
+    const toPath = destDir ? `${destDir}/${base}` : base
+    if (toPath === fromPath) return
+    if (destDir && (destDir === fromPath || destDir.startsWith(fromPath + '/'))) {
+      setMsg('无法移动到该位置')
+      setTimeout(() => setMsg(''), 3200)
+      return
+    }
+    if (files.some((f) => f.path === toPath)) {
+      if (!confirm(`已存在「${toPath}」，是否覆盖？`)) return
+    }
+    try {
+      let body: ArrayBuffer
+      let contentType: string
+      if (fromPath === activePath) {
+        const text = editorInstRef.current?.getModel()?.getValue() ?? ''
+        body = new TextEncoder().encode(text).buffer
+        contentType = 'text/plain; charset=utf-8'
+      } else {
+        const m = modelsRef.current.get(fromPath)
+        if (m) {
+          const text = m.getValue()
+          body = new TextEncoder().encode(text).buffer
+          contentType = 'text/plain; charset=utf-8'
+        } else {
+          const res = await fetch(
+            `${BASE()}/api/v1/projects/${projectId}/files/${encodeProjectFilePathForUrl(fromPath)}`,
+            { headers: { Authorization: `Bearer ${getToken() || ''}` } },
+          )
+          if (!res.ok) throw new Error(await res.text())
+          contentType = res.headers.get('Content-Type') || 'application/octet-stream'
+          body = await res.arrayBuffer()
+        }
+      }
+      await putProjectFileRaw(projectId, toPath, body, contentType)
+      const del = await fetch(
+        `${BASE()}/api/v1/projects/${projectId}/files/${encodeProjectFilePathForUrl(fromPath)}`,
+        { method: 'DELETE', headers: { Authorization: `Bearer ${getToken() || ''}` } },
+      )
+      if (!del.ok) throw new Error(await del.text())
+      modelsRef.current.get(fromPath)?.dispose()
+      modelsRef.current.delete(fromPath)
+      setOpenTabs((tabs) => tabs.map((p) => (p === fromPath ? toPath : p)))
+      if (activePath === fromPath) setActivePath(toPath)
+      if (mainPath === fromPath) {
+        await api(`/api/v1/projects/${projectId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ main_tex_path: toPath }),
+        })
+        setMainPath(toPath)
+      }
+      await loadFiles()
+      setMsg('已移动')
+      setTimeout(() => setMsg(''), 2000)
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : '移动失败')
     }
   }
 
@@ -2816,10 +2985,13 @@ export default function EditorPage() {
           onNewFile={(n) => void newFile(n)}
           onNewFolder={(prefix) => void newFolder(prefix)}
           onDelete={(p) => void deleteFile(p)}
+          onDeleteFolder={(prefix) => void deleteFolder(prefix)}
           onSetMain={(p) => void setMainTex(p)}
           onRenameFile={(p) => void renameProjectFile(p)}
           onDownloadFile={(p) => void downloadProjectFile(p)}
           onImportZipClick={() => zipInputRef.current?.click()}
+          onUploadDropped={(prefix, list) => void uploadProjectFilesWithPrefix(prefix, list)}
+          onMoveFile={(from, toPrefix) => void moveProjectFile(from, toPrefix)}
         />
       </div>
       {showFilesSplitGutter ? (
