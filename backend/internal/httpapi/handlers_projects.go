@@ -177,6 +177,9 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "storage error")
 		return
 	}
+	if err := s.EnsureAgentWorkspace(ctx, id); err != nil {
+		s.log.Warn("ensure agent workspace", "project", id, "err", err)
+	}
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id.String(), "name": req.Name, "main_tex_path": main})
 }
 
@@ -203,6 +206,9 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusNotFound, "not found")
 		return
+	}
+	if err := s.EnsureAgentWorkspace(ctx, pid); err != nil {
+		s.log.Warn("ensure agent workspace", "project", pid, "err", err)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": pid.String(), "name": name, "main_tex_path": main, "owner_id": owner.String(), "created_at": ts,
@@ -277,5 +283,8 @@ func (s *Server) handleShareProject(w http.ResponseWriter, r *http.Request) {
 	}
 	var name, main string
 	_ = s.pool.QueryRow(ctx, `SELECT name, main_tex_path FROM projects WHERE id=$1`, pid).Scan(&name, &main)
+	if err := s.EnsureAgentWorkspace(ctx, pid); err != nil {
+		s.log.Warn("ensure agent workspace", "project", pid, "err", err)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"id": pid.String(), "name": name, "main_tex_path": main, "share_role": role})
 }

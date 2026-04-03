@@ -4,11 +4,13 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -418,23 +420,97 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 		fl.Flush()
 	}
 
+	if err := s.EnsureAgentWorkspace(ctx, pid); err != nil {
+		s.log.Warn("ensure agent workspace", "project", pid, "err", err)
+	}
+	var mainTexRaw string
+	_ = s.pool.QueryRow(ctx, `SELECT main_tex_path FROM projects WHERE id=$1`, pid).Scan(&mainTexRaw)
+	mainTexSan, _ := sanitizeRelPath(mainTexRaw)
+	projRole := projectRoleFrom(ctx)
+
 	var plan, sum strings.Builder
+	pendingNew := map[string][]byte{}
+	pendingOld := map[string][]byte{}
+	const maxAgentProposalBytes = 512 * 1024
+
+	readFromStore := func(c context.Context, p string) ([]byte, error) {
+		obj, err := s.store.GetFile(c, pid, p)
+		if err != nil {
+			return nil, err
+		}
+		defer obj.Close()
+		return io.ReadAll(obj)
+	}
+
 	env := &agent.ToolEnv{
 		Ctx:       ctx,
 		ProjectID: pid.String(),
 		PlanBuf:   &plan,
 		SumBuf:    &sum,
+		BeforeStreamDone: func() {
+			if len(pendingNew) == 0 {
+				return
+			}
+			type fileEnc struct {
+				Path      string `json:"path"`
+				BeforeB64 string `json:"before_b64"`
+				AfterB64  string `json:"after_b64"`
+			}
+			paths := make([]string, 0, len(pendingNew))
+			for p := range pendingNew {
+				paths = append(paths, p)
+			}
+			sort.Strings(paths)
+			list := make([]fileEnc, 0, len(paths))
+			for _, p := range paths {
+				newB := pendingNew[p]
+				oldB := pendingOld[p]
+				list = append(list, fileEnc{
+					Path:      p,
+					BeforeB64: base64.StdEncoding.EncodeToString(oldB),
+					AfterB64:  base64.StdEncoding.EncodeToString(newB),
+				})
+			}
+			agent.WriteSSEJSON(w, fl, map[string]any{"type": "proposals", "files": list})
+		},
+		ListWorkspace: func(c context.Context) (string, error) {
+			prefix := AgentWorkspacePrefix + "/%"
+			rows, err := s.pool.Query(c, `SELECT path, size_bytes FROM project_files WHERE project_id=$1 AND path LIKE $2 ORDER BY path`, pid, prefix)
+			if err != nil {
+				return "", err
+			}
+			defer rows.Close()
+			var b strings.Builder
+			for rows.Next() {
+				var p string
+				var sz int64
+				if err := rows.Scan(&p, &sz); err != nil {
+					return "", err
+				}
+				b.WriteString(p)
+				b.WriteByte('\t')
+				b.WriteString(fmt.Sprintf("%d", sz))
+				b.WriteByte('\n')
+			}
+			if b.Len() == 0 {
+				return fmt.Sprintf("(沙箱 %s/ 下尚无文件；请在文件树中向该目录上传 PDF 等附件)", AgentWorkspacePrefix), nil
+			}
+			return strings.TrimSuffix(b.String(), "\n"), nil
+		},
 		ReadFile: func(c context.Context, rel string) ([]byte, error) {
 			p, ok := sanitizeRelPath(rel)
 			if !ok {
 				return nil, fmt.Errorf("invalid path")
 			}
-			obj, err := s.store.GetFile(c, pid, p)
-			if err != nil {
+			if err := agentSandboxReadPath(p, mainTexSan); err != nil {
 				return nil, err
 			}
-			defer obj.Close()
-			return io.ReadAll(obj)
+			if b, ok := pendingNew[p]; ok {
+				out := make([]byte, len(b))
+				copy(out, b)
+				return out, nil
+			}
+			return readFromStore(c, p)
 		},
 		WriteFile: func(c context.Context, rel string, data []byte) error {
 			if projectRoleFrom(c) == "viewer" {
@@ -444,7 +520,21 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return fmt.Errorf("invalid path")
 			}
-			return s.putBytesFile(c, pid, p, data)
+			if err := agentSandboxWritePath(p); err != nil {
+				return err
+			}
+			if len(data) > maxAgentProposalBytes {
+				return s.putBytesFile(c, pid, p, data)
+			}
+			if _, exists := pendingNew[p]; !exists {
+				oldB, err := readFromStore(c, p)
+				if err != nil {
+					oldB = nil
+				}
+				pendingOld[p] = append([]byte(nil), oldB...)
+			}
+			pendingNew[p] = append([]byte(nil), data...)
+			return nil
 		},
 		ReadBib: func(c context.Context) ([]byte, error) {
 			rows, err := s.pool.Query(c, `SELECT path FROM project_files WHERE project_id=$1 AND lower(path) LIKE '%.bib' ORDER BY path LIMIT 4`, pid)
@@ -473,6 +563,12 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 				merged.Write(b)
 			}
 			return []byte(merged.String()), nil
+		},
+		LatexCompileRun: func(argsJSON string) (string, error) {
+			return s.agentCompileRunForTool(ctx, pid, uid, projRole, argsJSON)
+		},
+		LatexCompileJob: func(jobID string) (string, error) {
+			return s.agentCompileJobForTool(ctx, pid, jobID)
 		},
 	}
 	ov := &agent.LLMOverrides{

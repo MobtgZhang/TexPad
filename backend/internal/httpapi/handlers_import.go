@@ -184,6 +184,9 @@ func (s *Server) importFilesIntoNewProject(ctx context.Context, uid uuid.UUID, n
 			return uuid.Nil, err
 		}
 	}
+	if err := s.EnsureAgentWorkspace(ctx, id); err != nil {
+		s.log.Warn("ensure agent workspace", "project", id, "err", err)
+	}
 	return id, nil
 }
 
