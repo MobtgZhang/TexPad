@@ -33,6 +33,8 @@ type ToolEnv struct {
 	LatexCompileRun func(argsJSON string) (string, error)
 	// LaTeX 编译任务查询：job_id 为空则取本项目最近一条；返回状态与截断日志。
 	LatexCompileJob func(jobID string) (string, error)
+	// Progress 可选：后台任务（如 Paperclaw）上报进度，pct 建议 0–100。
+	Progress func(pct int, msg string)
 }
 
 func isBlockedHost(host string) bool {
@@ -252,111 +254,5 @@ func ExecuteTool(env *ToolEnv, name, argsJSON string) (string, error) {
 		return "summary recorded", nil
 	default:
 		return "", fmt.Errorf("unknown tool %q", name)
-	}
-}
-
-func openAIToolDefs() []map[string]any {
-	return []map[string]any{
-		{"type": "function", "function": map[string]any{
-			"name": "web_fetch", "description": "HTTP GET a public URL; returns text excerpt.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"url": map[string]any{"type": "string"},
-				},
-				"required": []string{"url"},
-			},
-		}},
-		{"type": "function", "function": map[string]any{
-			"name": "web_download", "description": "Download URL body (size-capped) for inspection.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"url": map[string]any{"type": "string"},
-				},
-				"required": []string{"url"},
-			},
-		}},
-		{"type": "function", "function": map[string]any{
-			"name": "shell_exec", "description": "Run allowlisted read-only shell commands (kpsewhich, latexmk -version).",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"command": map[string]any{"type": "string"},
-				},
-				"required": []string{"command"},
-			},
-		}},
-		{"type": "function", "function": map[string]any{
-			"name": "workspace_list", "description": "List files under the project workspace/ sandbox (papers, PDFs, notes). Call this first when the user mentions attachments or papers.",
-			"parameters": map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
-			},
-		}},
-		{"type": "function", "function": map[string]any{
-			"name": "file_read", "description": "Read a project file by relative path. PDFs and general attachments must live under workspace/; .tex/.bib and common image formats may be elsewhere.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"path": map[string]any{"type": "string"},
-				},
-				"required": []string{"path"},
-			},
-		}},
-		{"type": "function", "function": map[string]any{
-			"name": "file_write", "description": "Stage a new version of a text file for user review (workspace/ or .tex/.bib). The editor shows before/after; nothing is saved until the user accepts.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"path": map[string]any{"type": "string"},
-					"content": map[string]any{"type": "string"},
-				},
-				"required": []string{"path", "content"},
-			},
-		}},
-		{"type": "function", "function": map[string]any{
-			"name": "latex_compile_run", "description": "Enqueue a LaTeX compile for this project (same as the editor compile button). Returns job_id; poll latex_compile_job until success or failed.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"engine":       map[string]any{"type": "string", "description": "pdflatex | xelatex | lualatex | context"},
-					"draft_mode":   map[string]any{"type": "boolean"},
-					"halt_on_error": map[string]any{"type": "boolean"},
-					"clean_build":  map[string]any{"type": "boolean"},
-					"syntax_check": map[string]any{"type": "boolean"},
-					"texlive_year": map[string]any{"type": "string", "description": "2024 or 2025"},
-				},
-			},
-		}},
-		{"type": "function", "function": map[string]any{
-			"name": "latex_compile_job", "description": "Get compile job status and log excerpt for this project. Omit job_id to use the latest job. Use after latex_compile_run to debug errors.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"job_id": map[string]any{"type": "string", "description": "UUID from latex_compile_run; empty = latest job"},
-				},
-			},
-		}},
-		{"type": "function", "function": map[string]any{
-			"name": "task_plan", "description": "Record a planning step for the session.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"step": map[string]any{"type": "string"},
-				},
-				"required": []string{"step"},
-			},
-		}},
-		{"type": "function", "function": map[string]any{
-			"name": "task_summary", "description": "Record a short progress summary.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"text": map[string]any{"type": "string"},
-				},
-				"required": []string{"text"},
-			},
-		}},
 	}
 }

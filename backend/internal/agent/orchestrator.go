@@ -10,10 +10,13 @@ import (
 )
 
 func writeSSEDone(w http.ResponseWriter, env *ToolEnv) {
-	fl, _ := w.(http.Flusher)
 	if env != nil && env.BeforeStreamDone != nil {
 		env.BeforeStreamDone()
 	}
+	if w == nil {
+		return
+	}
+	fl, _ := w.(http.Flusher)
 	writeSSE(w, fl, map[string]string{"type": "done"})
 }
 
@@ -32,7 +35,7 @@ func (s *Service) RunAgentPipeline(ctx context.Context, userID, projectID uuid.U
 	if !ok {
 		writeSSE(w, fl, map[string]string{"type": "note", "content": "LLM 未配置：请在服务器环境变量中设置 TEXPAD_LLM_BASE_URL / TEXPAD_LLM_API_KEY，或在编辑器「设置 → Agent」中填写。"})
 		writeSSEDone(w, env)
-		return nil
+		return ErrLLMNotConfigured
 	}
 
 	maxSteps := 10
@@ -90,7 +93,7 @@ func (s *Service) RunAgentPipeline(ctx context.Context, userID, projectID uuid.U
 		if err != nil {
 			writeSSE(w, fl, map[string]string{"type": "error", "content": UserFacingUpstreamError(err)})
 			writeSSEDone(w, env)
-			return nil
+			return err
 		}
 		chunkEmitTokens(w, fl, content)
 		fullAnswer.WriteString(content)
@@ -100,14 +103,20 @@ func (s *Service) RunAgentPipeline(ctx context.Context, userID, projectID uuid.U
 			{"role": "user", "content": userMessageContent(lastUser, images)},
 		}
 		_, _ = s.chatStream(ctx, rt, thinkMsgs, w, fl, "thinking")
+		if env != nil && env.Progress != nil {
+			env.Progress(10, "推理阶段完成，开始工具调用")
+		}
 
-		tools := openAIToolDefs()
+		tools := OpenAIToolDefinitions()
 		for step := 0; step < maxSteps; step++ {
+			if env != nil && env.Progress != nil {
+				env.Progress(15+step*5, fmt.Sprintf("模型回合 %d/%d", step+1, maxSteps))
+			}
 			content, calls, err := s.chatCompleteTools(ctx, rt, msgs, tools)
 			if err != nil {
 				writeSSE(w, fl, map[string]string{"type": "error", "content": UserFacingUpstreamError(err)})
 				writeSSEDone(w, env)
-				return nil
+				return err
 			}
 			if len(calls) == 0 {
 				if strings.TrimSpace(content) == "" {
@@ -141,6 +150,9 @@ func (s *Service) RunAgentPipeline(ctx context.Context, userID, projectID uuid.U
 			for _, c := range calls {
 				argsShow := truncate(c.Arguments, 4000)
 				writeSSE(w, fl, map[string]string{"type": "tool_start", "name": c.Name, "args": argsShow})
+				if env != nil && env.Progress != nil {
+					env.Progress(40+step*4, "工具："+c.Name)
+				}
 				out, err := ExecuteTool(env, c.Name, c.Arguments)
 				if err != nil {
 					out = "error: " + err.Error()
@@ -179,6 +191,9 @@ func (s *Service) RunAgentPipeline(ctx context.Context, userID, projectID uuid.U
 	}
 
 	_ = s.saveMemory(ctx, userID, projectID, "session", truncate(ans, 8000))
+	if env != nil && env.Progress != nil {
+		env.Progress(95, "正在保存会话摘要…")
+	}
 	writeSSEDone(w, env)
 	return nil
 }

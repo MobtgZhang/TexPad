@@ -190,6 +190,9 @@ func parseStreamDelta(line []byte) string {
 }
 
 func writeSSE(w io.Writer, flusher http.Flusher, m map[string]string) {
+	if w == nil {
+		return
+	}
 	b, _ := json.Marshal(m)
 	_, _ = io.WriteString(w, "data: "+string(b)+"\n\n")
 	if flusher != nil {
@@ -199,6 +202,9 @@ func writeSSE(w io.Writer, flusher http.Flusher, m map[string]string) {
 
 // WriteSSEJSON 发送任意 JSON 对象事件（如 proposals），供前端解析。
 func WriteSSEJSON(w io.Writer, flusher http.Flusher, v any) {
+	if w == nil {
+		return
+	}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return
@@ -210,6 +216,9 @@ func WriteSSEJSON(w io.Writer, flusher http.Flusher, v any) {
 }
 
 func chunkEmitTokens(w io.Writer, flusher http.Flusher, text string) {
+	if w == nil {
+		return
+	}
 	const step = 28
 	r := []rune(text)
 	for i := 0; i < len(r); i += step {

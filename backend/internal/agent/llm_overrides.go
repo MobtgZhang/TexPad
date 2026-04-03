@@ -23,6 +23,12 @@ type llmRuntime struct {
 	topK      *float64
 }
 
+// LLMConfigured 是否具备可调用 LLM（环境变量或 o 中的覆盖）。
+func (s *Service) LLMConfigured(o *LLMOverrides) bool {
+	_, ok := s.resolveLLM(o)
+	return ok
+}
+
 func (s *Service) resolveLLM(o *LLMOverrides) (llmRuntime, bool) {
 	r := llmRuntime{
 		baseURL:   strings.TrimRight(s.cfg.LLMBaseURL, "/"),
