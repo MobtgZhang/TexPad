@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,6 +30,14 @@ func main() {
 
 	cfg := config.Load()
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	if err := config.ValidateCompile(cfg); err != nil {
+		log.Error("compile config invalid", "err", err)
+		os.Exit(1)
+	}
+	if len(cfg.JWTSecret) < 24 || strings.Contains(cfg.JWTSecret, "change-me") || strings.Contains(cfg.JWTSecret, "dev-insecure") {
+		log.Warn("JWT secret looks weak; set TEXPAD_JWT_SECRET to a long random value before any network exposure")
+	}
 
 	ctx := context.Background()
 	pool, err := db.NewPool(ctx, cfg.DatabaseURL)
@@ -71,9 +81,15 @@ func main() {
 		CompileDockerVolume: cfg.CompileDockerVolume,
 		CompileWorkspaceDir: cfg.CompileWorkspaceDir,
 	})
-	pc := paperclaw.NewManager(pool, log, 2)
+	var srv *httpapi.Server
+	pc := paperclaw.NewManager(pool, log, 2, func(c context.Context, jid uuid.UUID) error {
+		if srv == nil {
+			return fmt.Errorf("server not initialized")
+		}
+		return srv.RunPaperclawJob(c, jid)
+	})
 	ag := agent.New(cfg, pool, rdb)
-	srv := httpapi.New(cfg, log, pool, rdb, st, comp, pc, ag)
+	srv = httpapi.New(cfg, log, pool, rdb, st, comp, pc, ag)
 
 	comp.OnFinish = func(projectID, jobID uuid.UUID) {
 		srv.PublishCompileDone(projectID, jobID)

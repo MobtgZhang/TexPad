@@ -159,6 +159,11 @@ func allowedFile(rel string) bool {
 	return allowedExt[ext]
 }
 
+const sqlSelectPathsUnderPrefix = `
+SELECT path FROM project_files
+WHERE project_id=$1
+AND (path=$2 OR (char_length(path) > char_length($2) AND substring(path from 1 for char_length($2)+1) = ($2 || '/')))`
+
 func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if projectRoleFrom(ctx) == "viewer" {
@@ -171,8 +176,40 @@ func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid path")
 		return
 	}
-	_ = s.store.RemoveFile(ctx, pid, rel)
-	_, _ = s.pool.Exec(ctx, `DELETE FROM project_files WHERE project_id=$1 AND path=$2`, pid, rel)
+	recursive := r.URL.Query().Get("recursive") == "1" || strings.EqualFold(r.URL.Query().Get("recursive"), "true")
+	if !recursive {
+		_ = s.store.RemoveFile(ctx, pid, rel)
+		_, _ = s.pool.Exec(ctx, `DELETE FROM project_files WHERE project_id=$1 AND path=$2`, pid, rel)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	rows, err := s.pool.Query(ctx, sqlSelectPathsUnderPrefix, pid, rel)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			rows.Close()
+			writeError(w, http.StatusInternalServerError, "scan error")
+			return
+		}
+		paths = append(paths, p)
+	}
+	rows.Close()
+	for _, p := range paths {
+		_ = s.store.RemoveFile(ctx, pid, p)
+	}
+	_, err = s.pool.Exec(ctx, `
+DELETE FROM project_files
+WHERE project_id=$1
+AND (path=$2 OR (char_length(path) > char_length($2) AND substring(path from 1 for char_length($2)+1) = ($2 || '/')))`, pid, rel)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db error")
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

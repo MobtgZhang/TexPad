@@ -580,7 +580,9 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 		TopK:         req.TopK,
 		MaxToolSteps: req.MaxToolSteps,
 	}
-	_ = s.agent.RunAgentPipeline(ctx, uid, pid, req.Messages, req.Images, env, w, ov)
+	if err := s.agent.RunAgentPipeline(ctx, uid, pid, req.Messages, req.Images, env, w, ov); err != nil && !errors.Is(err, agent.ErrLLMNotConfigured) {
+		s.log.Warn("agent stream ended with error", "err", err)
+	}
 }
 
 type agentModelsReq struct {

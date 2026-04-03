@@ -104,6 +104,8 @@ func (s *Server) Router() http.Handler {
 
 				r.Post("/paperclaw/jobs", s.handlePaperclawCreateJob)
 				r.Get("/paperclaw/jobs/{jobID}", s.handlePaperclawJob)
+				r.Post("/paperclaw/jobs/{jobID}/cancel", s.handlePaperclawCancelJob)
+				r.Get("/agent/llm-configured", s.handleAgentLLMConfigured)
 				r.Get("/pdf/latest/download", s.handleLatestPDFDownload)
 				r.Get("/pdf/{jobID}/download", s.handlePDFDownload)
 				r.Post("/duplicate", s.handleDuplicateProject)
