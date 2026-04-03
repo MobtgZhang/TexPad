@@ -19,13 +19,20 @@ const maxFetchBytes = 512 * 1024
 
 // ToolEnv binds project file IO and optional scratch buffers for plan/summary.
 type ToolEnv struct {
-	Ctx       context.Context
-	ProjectID string
-	ReadFile  func(ctx context.Context, rel string) ([]byte, error)
-	WriteFile func(ctx context.Context, rel string, data []byte) error
-	ReadBib   func(ctx context.Context) ([]byte, error)
-	PlanBuf   *strings.Builder
-	SumBuf    *strings.Builder
+	Ctx           context.Context
+	ProjectID     string
+	ReadFile      func(ctx context.Context, rel string) ([]byte, error)
+	WriteFile     func(ctx context.Context, rel string, data []byte) error
+	ReadBib       func(ctx context.Context) ([]byte, error)
+	ListWorkspace func(ctx context.Context) (string, error)
+	PlanBuf       *strings.Builder
+	SumBuf        *strings.Builder
+	// BeforeStreamDone 在写出 type=done 之前调用（例如推送待审核的文件修改）。
+	BeforeStreamDone func()
+	// LaTeX 编译：入队一次编译（与编辑器「编译」一致）；返回人类可读摘要含 job_id。
+	LatexCompileRun func(argsJSON string) (string, error)
+	// LaTeX 编译任务查询：job_id 为空则取本项目最近一条；返回状态与截断日志。
+	LatexCompileJob func(jobID string) (string, error)
 }
 
 func isBlockedHost(host string) bool {
@@ -212,6 +219,22 @@ func ExecuteTool(env *ToolEnv, name, argsJSON string) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("wrote %d bytes to %s", len(c), p), nil
+	case "workspace_list":
+		if env.ListWorkspace == nil {
+			return "", fmt.Errorf("workspace_list unavailable")
+		}
+		return env.ListWorkspace(env.Ctx)
+	case "latex_compile_run":
+		if env.LatexCompileRun == nil {
+			return "", fmt.Errorf("latex_compile_run unavailable")
+		}
+		return env.LatexCompileRun(argsJSON)
+	case "latex_compile_job":
+		id, _ := args["job_id"].(string)
+		if env.LatexCompileJob == nil {
+			return "", fmt.Errorf("latex_compile_job unavailable")
+		}
+		return env.LatexCompileJob(id)
 	case "task_plan":
 		step, _ := args["step"].(string)
 		if env.PlanBuf != nil && step != "" {
@@ -265,7 +288,14 @@ func openAIToolDefs() []map[string]any {
 			},
 		}},
 		{"type": "function", "function": map[string]any{
-			"name": "file_read", "description": "Read a text file from the project.",
+			"name": "workspace_list", "description": "List files under the project workspace/ sandbox (papers, PDFs, notes). Call this first when the user mentions attachments or papers.",
+			"parameters": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		}},
+		{"type": "function", "function": map[string]any{
+			"name": "file_read", "description": "Read a project file by relative path. PDFs and general attachments must live under workspace/; .tex/.bib and common image formats may be elsewhere.",
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -275,7 +305,7 @@ func openAIToolDefs() []map[string]any {
 			},
 		}},
 		{"type": "function", "function": map[string]any{
-			"name": "file_write", "description": "Write or overwrite a text file in the project.",
+			"name": "file_write", "description": "Stage a new version of a text file for user review (workspace/ or .tex/.bib). The editor shows before/after; nothing is saved until the user accepts.",
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -283,6 +313,29 @@ func openAIToolDefs() []map[string]any {
 					"content": map[string]any{"type": "string"},
 				},
 				"required": []string{"path", "content"},
+			},
+		}},
+		{"type": "function", "function": map[string]any{
+			"name": "latex_compile_run", "description": "Enqueue a LaTeX compile for this project (same as the editor compile button). Returns job_id; poll latex_compile_job until success or failed.",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"engine":       map[string]any{"type": "string", "description": "pdflatex | xelatex | lualatex | context"},
+					"draft_mode":   map[string]any{"type": "boolean"},
+					"halt_on_error": map[string]any{"type": "boolean"},
+					"clean_build":  map[string]any{"type": "boolean"},
+					"syntax_check": map[string]any{"type": "boolean"},
+					"texlive_year": map[string]any{"type": "string", "description": "2024 or 2025"},
+				},
+			},
+		}},
+		{"type": "function", "function": map[string]any{
+			"name": "latex_compile_job", "description": "Get compile job status and log excerpt for this project. Omit job_id to use the latest job. Use after latex_compile_run to debug errors.",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"job_id": map[string]any{"type": "string", "description": "UUID from latex_compile_run; empty = latest job"},
+				},
 			},
 		}},
 		{"type": "function", "function": map[string]any{

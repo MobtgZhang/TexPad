@@ -9,6 +9,14 @@ import (
 	"github.com/google/uuid"
 )
 
+func writeSSEDone(w http.ResponseWriter, env *ToolEnv) {
+	fl, _ := w.(http.Flusher)
+	if env != nil && env.BeforeStreamDone != nil {
+		env.BeforeStreamDone()
+	}
+	writeSSE(w, fl, map[string]string{"type": "done"})
+}
+
 // ImagePart is a base64 image attached to the latest user turn.
 type ImagePart struct {
 	Mime string `json:"mime"`
@@ -23,7 +31,7 @@ func (s *Service) RunAgentPipeline(ctx context.Context, userID, projectID uuid.U
 	rt, ok := s.resolveLLM(o)
 	if !ok {
 		writeSSE(w, fl, map[string]string{"type": "note", "content": "LLM 未配置：请在服务器环境变量中设置 TEXPAD_LLM_BASE_URL / TEXPAD_LLM_API_KEY，或在编辑器「设置 → Agent」中填写。"})
-		writeSSE(w, fl, map[string]string{"type": "done"})
+		writeSSEDone(w, env)
 		return nil
 	}
 
@@ -81,7 +89,7 @@ func (s *Service) RunAgentPipeline(ctx context.Context, userID, projectID uuid.U
 		content, _, err := s.chatCompleteTools(ctx, rt, msgs, nil)
 		if err != nil {
 			writeSSE(w, fl, map[string]string{"type": "error", "content": UserFacingUpstreamError(err)})
-			writeSSE(w, fl, map[string]string{"type": "done"})
+			writeSSEDone(w, env)
 			return nil
 		}
 		chunkEmitTokens(w, fl, content)
@@ -98,7 +106,7 @@ func (s *Service) RunAgentPipeline(ctx context.Context, userID, projectID uuid.U
 			content, calls, err := s.chatCompleteTools(ctx, rt, msgs, tools)
 			if err != nil {
 				writeSSE(w, fl, map[string]string{"type": "error", "content": UserFacingUpstreamError(err)})
-				writeSSE(w, fl, map[string]string{"type": "done"})
+				writeSSEDone(w, env)
 				return nil
 			}
 			if len(calls) == 0 {
@@ -171,7 +179,7 @@ func (s *Service) RunAgentPipeline(ctx context.Context, userID, projectID uuid.U
 	}
 
 	_ = s.saveMemory(ctx, userID, projectID, "session", truncate(ans, 8000))
-	writeSSE(w, fl, map[string]string{"type": "done"})
+	writeSSEDone(w, env)
 	return nil
 }
 

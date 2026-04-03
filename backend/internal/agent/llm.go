@@ -197,6 +197,18 @@ func writeSSE(w io.Writer, flusher http.Flusher, m map[string]string) {
 	}
 }
 
+// WriteSSEJSON 发送任意 JSON 对象事件（如 proposals），供前端解析。
+func WriteSSEJSON(w io.Writer, flusher http.Flusher, v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	_, _ = io.WriteString(w, "data: "+string(b)+"\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
 func chunkEmitTokens(w io.Writer, flusher http.Flusher, text string) {
 	const step = 28
 	r := []rune(text)

@@ -23,6 +23,11 @@ func compressForTier(s string, max int) string {
 	return s[:max] + "\n…(compressed)"
 }
 
+// CompressToolOutput 供 httpapi 等包截断工具返回值（如编译日志）。
+func CompressToolOutput(s string, max int) string {
+	return compressForTier(s, max)
+}
+
 func (s *Service) loadMemoryBlock(ctx context.Context, userID, projectID uuid.UUID) string {
 	var b strings.Builder
 	if s.rdb != nil {
