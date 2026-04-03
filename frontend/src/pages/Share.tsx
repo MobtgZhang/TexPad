@@ -4,6 +4,16 @@ import { useParams } from 'react-router-dom'
 
 const BASE = import.meta.env.VITE_API_BASE || ''
 
+function encodeProjectFilePathForUrl(rel: string): string {
+  return rel
+    .replace(/\\/g, '/')
+    .trim()
+    .split('/')
+    .filter(Boolean)
+    .map((seg) => encodeURIComponent(seg))
+    .join('/')
+}
+
 export default function Share() {
   const { token } = useParams<{ token: string }>()
   const [name, setName] = useState('')
@@ -17,7 +27,7 @@ export default function Share() {
       const p = (await r.json()) as { name: string; main_tex_path: string }
       setName(p.name)
       setMain(p.main_tex_path)
-      const fr = await fetch(`${BASE}/api/v1/share/${token}/files/${encodeURIComponent(p.main_tex_path)}`)
+      const fr = await fetch(`${BASE}/api/v1/share/${token}/files/${encodeProjectFilePathForUrl(p.main_tex_path)}`)
       setText(await fr.text())
     })().catch(() => setText('% load error'))
   }, [token])

@@ -89,8 +89,33 @@ function registerLatex(m: typeof monaco) {
 
 const BASE = () => (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '')
 
+/** 与 chi `/files/*` 一致：保留路径中的 `/`，逐段 encode（避免 figures/foo 被整段 encode 成 figures%2Ffoo 导致 404） */
+function encodeProjectFilePathForUrl(rel: string): string {
+  return rel
+    .replace(/\\/g, '/')
+    .trim()
+    .split('/')
+    .filter(Boolean)
+    .map((seg) => encodeURIComponent(seg))
+    .join('/')
+}
+
+function decodeProposalB64(b64: string): string {
+  if (!b64) return ''
+  try {
+    const bin = atob(b64)
+    const bytes = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes)
+  } catch {
+    return ''
+  }
+}
+
+type AgentFileProposal = { path: string; before: string; after: string }
+
 async function fetchProjectFile(pid: string, p: string): Promise<string> {
-  const res = await fetch(`${BASE()}/api/v1/projects/${pid}/files/${encodeURIComponent(p)}`, {
+  const res = await fetch(`${BASE()}/api/v1/projects/${pid}/files/${encodeProjectFilePathForUrl(p)}`, {
     headers: { Authorization: `Bearer ${getToken() || ''}` },
   })
   if (!res.ok) throw new Error(await res.text())
@@ -98,7 +123,7 @@ async function fetchProjectFile(pid: string, p: string): Promise<string> {
 }
 
 async function putProjectFile(pid: string, p: string, body: string) {
-  const res = await fetch(`${BASE()}/api/v1/projects/${pid}/files/${encodeURIComponent(p)}`, {
+  const res = await fetch(`${BASE()}/api/v1/projects/${pid}/files/${encodeProjectFilePathForUrl(p)}`, {
     method: 'PUT',
     headers: {
       Authorization: `Bearer ${getToken() || ''}`,
@@ -259,6 +284,10 @@ export default function EditorPage() {
   const [agentMessages, setAgentMessages] = useState<AgentChatTurn[]>([])
   const [agentInput, setAgentInput] = useState('')
   const [agentSending, setAgentSending] = useState(false)
+  const [agentProposals, setAgentProposals] = useState<AgentFileProposal[]>([])
+  const [agentProposalPanelOpen, setAgentProposalPanelOpen] = useState(false)
+  /** 左侧/弹窗智能体：仅首屏显示引导文案与快捷问题；用户一旦发问过则只保留对话区 */
+  const [agentWelcomeChrome, setAgentWelcomeChrome] = useState(true)
   const [collabOn] = useState(() => !!import.meta.env.VITE_COLLAB_WS)
   const [files, setFiles] = useState<FileEnt[]>([])
   const [openTabs, setOpenTabs] = useState<string[]>([])
@@ -378,6 +407,12 @@ export default function EditorPage() {
     if (!projectId) return
     void loadFiles()
   }, [projectId, loadFiles])
+
+  useEffect(() => {
+    setAgentProposals([])
+    setAgentProposalPanelOpen(false)
+    setAgentWelcomeChrome(true)
+  }, [projectId])
 
   useEffect(() => {
     if (files.length === 0) return
@@ -658,7 +693,7 @@ export default function EditorPage() {
     void (async () => {
       try {
         const res = await fetch(
-          `${BASE()}/api/v1/projects/${projectId}/files/${encodeURIComponent(activePath)}`,
+          `${BASE()}/api/v1/projects/${projectId}/files/${encodeProjectFilePathForUrl(activePath)}`,
           { headers: { Authorization: `Bearer ${getToken() || ''}` } },
         )
         if (!res.ok) {
@@ -1140,12 +1175,23 @@ export default function EditorPage() {
     const imgs = agentPendingImages
     if (!text && imgs.length === 0) return
 
+    setAgentWelcomeChrome(false)
+    setAgentSending(true)
+
     const imagePreviews: string[] = []
     const imageParts: { mime: string; data: string }[] = []
-    for (const f of imgs) {
-      const url = await readFileAsDataURL(f)
-      imagePreviews.push(url)
-      imageParts.push(dataURLToImagePart(url))
+    try {
+      for (const f of imgs) {
+        const url = await readFileAsDataURL(f)
+        imagePreviews.push(url)
+        imageParts.push(dataURLToImagePart(url))
+      }
+    } catch {
+      setAgentWelcomeChrome(true)
+      setAgentSending(false)
+      setMsg('读取附图失败，请重试或换一张图片。')
+      window.setTimeout(() => setMsg(''), 3200)
+      return
     }
 
     const prior = agentMessages.map((m) =>
@@ -1162,7 +1208,6 @@ export default function EditorPage() {
       { role: 'user', content: text || '(附图)', imagePreviews },
       { role: 'assistant', content: '', thinking: '', tools: [] },
     ])
-    setAgentSending(true)
 
     const applyEvent = (j: {
       type?: string
@@ -1269,8 +1314,24 @@ export default function EditorPage() {
               name?: string
               args?: string
               result?: string
+              files?: { path: string; before_b64?: string; after_b64?: string }[]
             }
             if (j.type === 'done') continue
+            if (j.type === 'proposals' && Array.isArray(j.files)) {
+              setAgentProposals((prev) => {
+                const m = new Map(prev.map((x) => [x.path, x]))
+                for (const f of j.files!) {
+                  if (!f.path || f.after_b64 === undefined) continue
+                  m.set(f.path, {
+                    path: f.path,
+                    before: decodeProposalB64(f.before_b64 || ''),
+                    after: decodeProposalB64(f.after_b64),
+                  })
+                }
+                return [...m.values()]
+              })
+              continue
+            }
             applyEvent(j)
           } catch {
             /* ignore */
@@ -1284,6 +1345,36 @@ export default function EditorPage() {
       setAgentSending(false)
     }
   }
+
+  const acceptAgentProposals = useCallback(async () => {
+    if (!projectId || role === 'viewer' || agentProposals.length === 0) return
+    const n = agentProposals.length
+    const batch = agentProposals
+    try {
+      for (const f of batch) {
+        await putProjectFile(projectId, f.path, f.after)
+      }
+      await loadFiles()
+      for (const f of batch) {
+        const model = modelsRef.current.get(f.path)
+        if (model && !model.isDisposed() && !binaryPreviewKindForPath(f.path)) {
+          model.setValue(f.after)
+        }
+      }
+      setAgentProposals([])
+      setAgentProposalPanelOpen(false)
+      setMsg(`已应用智能体修改（${n} 个文件）`)
+      window.setTimeout(() => setMsg(''), 2800)
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : '应用修改失败')
+      window.setTimeout(() => setMsg(''), 4000)
+    }
+  }, [projectId, role, agentProposals, loadFiles])
+
+  const rejectAgentProposals = useCallback(() => {
+    setAgentProposals([])
+    setAgentProposalPanelOpen(false)
+  }, [])
 
   async function newFile(name: string) {
     if (!projectId || role === 'viewer') return
@@ -1306,7 +1397,7 @@ export default function EditorPage() {
   async function deleteFile(p: string) {
     if (!projectId || role === 'viewer') return
     if (!confirm(`删除 ${p}？`)) return
-    await fetch(`${BASE()}/api/v1/projects/${projectId}/files/${encodeURIComponent(p)}`, {
+    await fetch(`${BASE()}/api/v1/projects/${projectId}/files/${encodeProjectFilePathForUrl(p)}`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${getToken() || ''}` },
     })
@@ -1332,7 +1423,7 @@ export default function EditorPage() {
     const content = editorInstRef.current?.getModel()?.getValue() ?? ''
     try {
       await putProjectFile(projectId, next, content)
-      const del = await fetch(`${BASE()}/api/v1/projects/${projectId}/files/${encodeURIComponent(activePath)}`, {
+      const del = await fetch(`${BASE()}/api/v1/projects/${projectId}/files/${encodeProjectFilePathForUrl(activePath)}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${getToken() || ''}` },
       })
@@ -1354,6 +1445,72 @@ export default function EditorPage() {
       setTimeout(() => setMsg(''), 2000)
     } catch (e) {
       setMsg(e instanceof Error ? e.message : '重命名失败')
+    }
+  }
+
+  async function renameProjectFile(oldPath: string) {
+    if (!projectId || role === 'viewer' || !oldPath) return
+    if (collabOn) {
+      setMsg('协作模式下暂不支持重命名文件')
+      setTimeout(() => setMsg(''), 3200)
+      return
+    }
+    const next = window.prompt('新文件路径（相对于项目根）', oldPath)?.trim()
+    if (!next || next === oldPath) return
+    let content: string
+    if (oldPath === activePath) {
+      content = editorInstRef.current?.getModel()?.getValue() ?? ''
+    } else {
+      const m = modelsRef.current.get(oldPath)
+      content = m ? m.getValue() : await fetchProjectFile(projectId, oldPath)
+    }
+    try {
+      await putProjectFile(projectId, next, content)
+      const del = await fetch(`${BASE()}/api/v1/projects/${projectId}/files/${encodeProjectFilePathForUrl(oldPath)}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${getToken() || ''}` },
+      })
+      if (!del.ok) throw new Error(await del.text())
+      modelsRef.current.get(oldPath)?.dispose()
+      modelsRef.current.delete(oldPath)
+      setOpenTabs((tabs) => tabs.map((p) => (p === oldPath ? next : p)))
+      if (activePath === oldPath) setActivePath(next)
+      if (mainPath === oldPath) {
+        await api(`/api/v1/projects/${projectId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ main_tex_path: next }),
+        })
+        setMainPath(next)
+      }
+      await loadFiles()
+      setMsg('已重命名')
+      setTimeout(() => setMsg(''), 2000)
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : '重命名失败')
+    }
+  }
+
+  async function downloadProjectFile(p: string) {
+    if (!projectId || !p) return
+    try {
+      const res = await fetch(`${BASE()}/api/v1/projects/${projectId}/files/${encodeProjectFilePathForUrl(p)}`, {
+        headers: { Authorization: `Bearer ${getToken() || ''}` },
+      })
+      if (!res.ok) throw new Error(await res.text())
+      const blob = await res.blob()
+      const base = p.replace(/\\/g, '/').split('/').filter(Boolean).pop() || 'file'
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = base
+      a.rel = 'noopener'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      window.setTimeout(() => URL.revokeObjectURL(url), 4000)
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : '下载失败')
     }
   }
 
@@ -2660,6 +2817,8 @@ export default function EditorPage() {
           onNewFolder={(prefix) => void newFolder(prefix)}
           onDelete={(p) => void deleteFile(p)}
           onSetMain={(p) => void setMainTex(p)}
+          onRenameFile={(p) => void renameProjectFile(p)}
+          onDownloadFile={(p) => void downloadProjectFile(p)}
           onImportZipClick={() => zipInputRef.current?.click()}
         />
       </div>
@@ -2766,6 +2925,7 @@ export default function EditorPage() {
           pendingImages={agentPendingImages}
           onPendingImages={setAgentPendingImages}
           title="自进化智能体"
+          showWelcomeChrome={agentWelcomeChrome}
           emptyHint="在下方描述目标或问题；可附带图片。智能体会结合项目上下文与工具链作答，并可在设置中调整模型与采样。"
           inputPlaceholder="想对当前项目做什么？"
           quickActions={agentQuickActions}
@@ -2966,6 +3126,35 @@ export default function EditorPage() {
         onRecompileFromScratch={() => void compile({ clean: true })}
         showBreadcrumb={viewPrefs.showBreadcrumbs}
       />
+
+      {agentProposals.length > 0 ? (
+        <div className="editor-agent-proposals-banner" role="status">
+          <span className="editor-agent-proposals-banner__text">
+            智能体建议修改 {agentProposals.length} 个文件（尚未写入项目，可对比后接受或撤销）
+          </span>
+          <span className="editor-agent-proposals-banner__actions">
+            <button
+              type="button"
+              className="editor-agent-proposals-banner__btn"
+              onClick={() => setAgentProposalPanelOpen(true)}
+              disabled={readOnly}
+            >
+              查看前后对比
+            </button>
+            <button
+              type="button"
+              className="editor-agent-proposals-banner__btn editor-agent-proposals-banner__btn--primary"
+              onClick={() => void acceptAgentProposals()}
+              disabled={readOnly}
+            >
+              全部接受
+            </button>
+            <button type="button" className="editor-agent-proposals-banner__btn" onClick={rejectAgentProposals}>
+              全部撤销
+            </button>
+          </span>
+        </div>
+      ) : null}
 
       {!narrow && viewPrefs.showEquationPreview && equationSnippet ? (
         <div className="editor-equation-preview" role="status" aria-live="polite">
@@ -3217,10 +3406,76 @@ export default function EditorPage() {
                 onSend={() => void sendAgentMessage()}
                 pendingImages={agentPendingImages}
                 onPendingImages={setAgentPendingImages}
+                showWelcomeChrome={agentWelcomeChrome}
                 emptyHint="在下方描述目标或问题；可附带图片。智能体会结合项目上下文与工具链作答，并可在设置中调整模型与采样。"
                 inputPlaceholder="想对当前项目做什么？"
                 quickActions={agentQuickActions}
               />
+            </div>
+          </div>
+        </>
+      ) : null}
+
+      {agentProposalPanelOpen && agentProposals.length > 0 ? (
+        <>
+          <div
+            className="editor-settings-scrim"
+            aria-hidden
+            onClick={() => setAgentProposalPanelOpen(false)}
+          />
+          <div
+            className="editor-agent-proposals-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="editor-agent-proposals-title"
+          >
+            <div className="editor-agent-proposals-dialog__head">
+              <h2 id="editor-agent-proposals-title" className="editor-agent-proposals-dialog__title">
+                智能体修改对比
+              </h2>
+              <button
+                type="button"
+                className="editor-settings-close"
+                onClick={() => setAgentProposalPanelOpen(false)}
+                aria-label="关闭"
+              >
+                ×
+              </button>
+            </div>
+            <div className="editor-agent-proposals-dialog__body">
+              {agentProposals.map((fp) => {
+                const cap = 24_000
+                const b = fp.before.length > cap ? `${fp.before.slice(0, cap)}\n\n…（已截断）` : fp.before
+                const a = fp.after.length > cap ? `${fp.after.slice(0, cap)}\n\n…（已截断）` : fp.after
+                return (
+                  <details key={fp.path} className="editor-agent-proposals-file" open>
+                    <summary className="editor-agent-proposals-file__path">{fp.path}</summary>
+                    <div className="editor-agent-proposals-diffgrid">
+                      <div className="editor-agent-proposals-diffcol">
+                        <div className="editor-agent-proposals-difflabel">修改前</div>
+                        <pre className="editor-agent-proposals-pre">{b}</pre>
+                      </div>
+                      <div className="editor-agent-proposals-diffcol">
+                        <div className="editor-agent-proposals-difflabel">修改后</div>
+                        <pre className="editor-agent-proposals-pre">{a}</pre>
+                      </div>
+                    </div>
+                  </details>
+                )
+              })}
+            </div>
+            <div className="editor-agent-proposals-dialog__foot">
+              <button
+                type="button"
+                className="editor-drawer-primary"
+                disabled={readOnly}
+                onClick={() => void acceptAgentProposals()}
+              >
+                全部接受并写入
+              </button>
+              <button type="button" className="editor-agent-proposals-banner__btn" onClick={rejectAgentProposals}>
+                全部撤销
+              </button>
             </div>
           </div>
         </>

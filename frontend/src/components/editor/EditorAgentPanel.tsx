@@ -102,6 +102,8 @@ export default function EditorAgentPanel(props: {
   onPendingImages: (files: File[]) => void
   /** 侧栏等场景可覆盖标题 */
   title?: string
+  /** 为 false 时隐藏标题、设置提示、快捷问题与空状态说明，仅保留对话与输入（由父级在用户首次发送后置为 false） */
+  showWelcomeChrome?: boolean
   /** 类似 Overleaf 的快捷开场，点击填入输入框 */
   quickActions?: AgentQuickAction[]
   /** 空状态与输入框占位 */
@@ -118,6 +120,7 @@ export default function EditorAgentPanel(props: {
     pendingImages,
     onPendingImages,
     title = '智能体对话',
+    showWelcomeChrome = true,
     quickActions,
     emptyHint = '在下方输入问题，可附带图片；支持工具链、思考过程与引用自检。',
     inputPlaceholder,
@@ -143,11 +146,16 @@ export default function EditorAgentPanel(props: {
   const placeholder =
     inputPlaceholder ?? (readOnly ? '只读项目无法使用智能体' : '输入消息…')
 
+  const hasUserTurn = messages.some((m) => m.role === 'user')
+  const showOnboarding = showWelcomeChrome && !hasUserTurn && !sending
+
   return (
     <div className="editor-agent-panel editor-agent-panel--chat-only">
-      <div className="editor-agent-panel__head">{title}</div>
-      <p className="editor-agent-panel__settings-hint">模型与采样请在「设置 → 智能体」中调整。</p>
-      {quickActions?.length ? (
+      {showWelcomeChrome ? <div className="editor-agent-panel__head">{title}</div> : null}
+      {showOnboarding ? (
+        <p className="editor-agent-panel__settings-hint">模型与采样请在「设置 → 智能体」中调整。</p>
+      ) : null}
+      {showOnboarding && quickActions?.length ? (
         <div className="editor-agent-panel__starters" aria-label="快捷提问">
           <div className="editor-agent-panel__starters-label">开始对话</div>
           <div className="editor-agent-panel__starters-chips">
@@ -166,7 +174,7 @@ export default function EditorAgentPanel(props: {
         </div>
       ) : null}
       <div className="editor-agent-panel__thread" role="log" aria-live="polite">
-        {messages.length === 0 ? <p className="editor-agent-panel__empty">{emptyHint}</p> : null}
+        {showOnboarding ? <p className="editor-agent-panel__empty">{emptyHint}</p> : null}
         {messages.map((m, i) => {
           if (m.role === 'user') {
             return (

@@ -1,10 +1,16 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 
 export type FileEnt = { path: string; size_bytes?: number }
 
 type DirNode = { kind: 'dir'; name: string; children: Map<string, TreeNode> }
 type FileNode = { kind: 'file'; name: string; path: string }
 type TreeNode = DirNode | FileNode
+
+type MenuState =
+  | null
+  | { kind: 'file'; path: string; x: number; y: number }
+  | { kind: 'dir'; prefix: string; x: number; y: number }
 
 /** 将错误存成单段的 URL 编码路径（如 figures%2Fa.pdf）还原为层级，展示用；path 仍为后端原始键 */
 function logicalPathSegments(rawPath: string): string[] {
@@ -20,7 +26,6 @@ function logicalPathSegments(rawPath: string): string[] {
   return logical.split('/').filter(Boolean)
 }
 
-/** 主文档路径与列表项可能一端为 URL 编码单段，用于高亮与 ★ */
 function sameProjectPath(a: string, b: string): boolean {
   if (a === b) return true
   return logicalPathSegments(a).join('/') === logicalPathSegments(b).join('/')
@@ -76,6 +81,16 @@ function IconUpload() {
   )
 }
 
+function IconMore() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+      <circle cx="5" cy="12" r="1.6" />
+      <circle cx="12" cy="12" r="1.6" />
+      <circle cx="19" cy="12" r="1.6" />
+    </svg>
+  )
+}
+
 function sortedKeys(map: Map<string, TreeNode>): string[] {
   return Array.from(map.keys()).sort((a, b) => {
     const na = map.get(a)!
@@ -83,6 +98,10 @@ function sortedKeys(map: Map<string, TreeNode>): string[] {
     if (na.kind !== nb.kind) return na.kind === 'dir' ? -1 : 1
     return a.localeCompare(b)
   })
+}
+
+function canSetMain(path: string): boolean {
+  return /\.(tex|bib)$/i.test(path)
 }
 
 export default function FileTree(props: {
@@ -97,6 +116,8 @@ export default function FileTree(props: {
   onNewFolder: (folderPrefix: string) => void
   onDelete: (path: string) => void
   onSetMain: (path: string) => void
+  onRenameFile: (path: string) => void
+  onDownloadFile: (path: string) => void
   onImportZipClick: () => void
 }) {
   const {
@@ -111,11 +132,15 @@ export default function FileTree(props: {
     onNewFolder,
     onDelete,
     onSetMain,
+    onRenameFile,
+    onDownloadFile,
     onImportZipClick,
   } = props
 
   const tree = useMemo(() => buildTree(files), [files])
   const [openDirs, setOpenDirs] = useState<Set<string>>(() => new Set())
+  const [menu, setMenu] = useState<MenuState>(null)
+  const menuRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     const parts = logicalPathSegments(activePath)
@@ -130,6 +155,24 @@ export default function FileTree(props: {
       return next
     })
   }, [activePath])
+
+  useEffect(() => {
+    if (!menu) return
+    const onDocMouseDown = (e: MouseEvent) => {
+      const el = menuRef.current
+      if (el && el.contains(e.target as Node)) return
+      setMenu(null)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMenu(null)
+    }
+    document.addEventListener('mousedown', onDocMouseDown, true)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDocMouseDown, true)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [menu])
 
   function toggleDir(key: string) {
     setOpenDirs((prev) => {
@@ -152,6 +195,27 @@ export default function FileTree(props: {
     onNewFolder(prefix)
   }
 
+  function openFileMenu(path: string, clientX: number, clientY: number) {
+    setMenu({ kind: 'file', path, x: clientX, y: clientY })
+  }
+
+  function openDirMenu(prefix: string, clientX: number, clientY: number) {
+    setMenu({ kind: 'dir', prefix, x: clientX, y: clientY })
+  }
+
+  function clampMenuPosition(x: number, y: number) {
+    const pad = 8
+    const mw = 220
+    const mh = 320
+    let nx = x
+    let ny = y
+    if (typeof window !== 'undefined') {
+      if (nx + mw > window.innerWidth - pad) nx = Math.max(pad, window.innerWidth - mw - pad)
+      if (ny + mh > window.innerHeight - pad) ny = Math.max(pad, window.innerHeight - mh - pad)
+    }
+    return { x: nx, y: ny }
+  }
+
   function renderLevel(map: Map<string, TreeNode>, prefix: string): ReactNode {
     const keys = sortedKeys(map)
     return keys.map((key) => {
@@ -159,31 +223,38 @@ export default function FileTree(props: {
       const fullKey = prefix ? `${prefix}/${key}` : key
       if (node.kind === 'file') {
         const isActive = sameProjectPath(node.path, activePath)
+        const isMain = sameProjectPath(node.path, mainPath)
         return (
           <li key={node.path} className="editor-ft-row">
             <button
               type="button"
-              className={`editor-ft-file ${isActive ? 'editor-ft-active' : ''}`}
+              className={`editor-ft-file ${isActive ? 'editor-ft-active' : ''}${isMain ? ' editor-ft-file--main' : ''}`}
               onClick={() => onOpen(node.path)}
+              onContextMenu={(e) => {
+                e.preventDefault()
+                if (readOnly) return
+                openFileMenu(node.path, e.clientX, e.clientY)
+              }}
               title={node.path}
             >
               {node.name}
-              {sameProjectPath(node.path, mainPath) ? ' ★' : ''}
             </button>
             {!readOnly && (
               <span className="editor-ft-actions">
-                {!sameProjectPath(node.path, mainPath) && /\.(tex|bib)$/i.test(node.path) && (
-                  <button
-                    type="button"
-                    className="editor-ft-mini"
-                    onClick={() => onSetMain(node.path)}
-                    title="设为主文档"
-                  >
-                    ★
-                  </button>
-                )}
-                <button type="button" className="editor-ft-mini" onClick={() => onDelete(node.path)} title="删除">
-                  ×
+                <button
+                  type="button"
+                  className="editor-ft-kebab"
+                  aria-label="文件菜单"
+                  aria-haspopup="menu"
+                  aria-expanded={menu?.kind === 'file' && sameProjectPath(menu.path, node.path)}
+                  onClick={(e) => {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+                    openFileMenu(node.path, r.right - 4, r.bottom + 2)
+                  }}
+                >
+                  <IconMore />
                 </button>
               </span>
             )}
@@ -203,7 +274,34 @@ export default function FileTree(props: {
             >
               {isOpen ? '▼' : '▶'}
             </button>
-            <span className="editor-ft-dirname">{node.name}/</span>
+            <span
+              className="editor-ft-dirname"
+              onContextMenu={(e) => {
+                e.preventDefault()
+                if (readOnly) return
+                openDirMenu(fullKey, e.clientX, e.clientY)
+              }}
+              role="presentation"
+            >
+              {node.name}/
+            </span>
+            {!readOnly && (
+              <button
+                type="button"
+                className="editor-ft-kebab editor-ft-kebab--dir"
+                aria-label="文件夹菜单"
+                aria-haspopup="menu"
+                aria-expanded={menu?.kind === 'dir' && menu.prefix === fullKey}
+                onClick={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+                  openDirMenu(fullKey, r.right - 4, r.bottom + 2)
+                }}
+              >
+                <IconMore />
+              </button>
+            )}
           </div>
           {isOpen && <ul className="editor-ft-nested">{renderLevel(node.children, fullKey)}</ul>}
         </li>
@@ -211,8 +309,86 @@ export default function FileTree(props: {
     })
   }
 
+  const menuPos = menu ? clampMenuPosition(menu.x, menu.y) : null
+  const menuPortal =
+    menu &&
+    menuPos &&
+    typeof document !== 'undefined' &&
+    createPortal(
+      <div
+        ref={menuRef}
+        className="editor-ft-menu"
+        role="menu"
+        style={{
+          position: 'fixed',
+          left: menuPos.x,
+          top: menuPos.y,
+          zIndex: 13000,
+        }}
+      >
+        {menu.kind === 'file' ? (
+          <>
+            {canSetMain(menu.path) && !sameProjectPath(menu.path, mainPath) ? (
+              <button type="button" className="editor-ft-menu__item" role="menuitem" onClick={() => { onSetMain(menu.path); setMenu(null) }}>
+                设为主文档
+              </button>
+            ) : null}
+            {canSetMain(menu.path) && sameProjectPath(menu.path, mainPath) ? (
+              <div className="editor-ft-menu__hint" role="presentation">
+                当前主文档
+              </div>
+            ) : null}
+            <button type="button" className="editor-ft-menu__item" role="menuitem" onClick={() => { onRenameFile(menu.path); setMenu(null) }}>
+              重命名
+            </button>
+            <button type="button" className="editor-ft-menu__item" role="menuitem" onClick={() => { onDownloadFile(menu.path); setMenu(null) }}>
+              下载
+            </button>
+            <div className="editor-ft-menu__sep" role="separator" />
+            <button type="button" className="editor-ft-menu__item editor-ft-menu__item--danger" role="menuitem" onClick={() => { onDelete(menu.path); setMenu(null) }}>
+              删除
+            </button>
+          </>
+        ) : (
+          <>
+            <button
+              type="button"
+              className="editor-ft-menu__item"
+              role="menuitem"
+              onClick={() => {
+                const def = `${menu.prefix}/new.tex`
+                const name = window.prompt('新文件路径（相对于项目根）', def)?.trim()
+                if (name) onNewFile(name)
+                setMenu(null)
+              }}
+            >
+              新建文件
+            </button>
+            <button
+              type="button"
+              className="editor-ft-menu__item"
+              role="menuitem"
+              onClick={() => {
+                const def = `${menu.prefix}/子文件夹`
+                const name = window.prompt('新文件夹路径', def)?.trim()
+                if (name) onNewFolder(name.replace(/\/+$/, ''))
+                setMenu(null)
+              }}
+            >
+              新建文件夹
+            </button>
+            <button type="button" className="editor-ft-menu__item" role="menuitem" onClick={() => { onImportZipClick(); setMenu(null) }}>
+              上传 zip 导入
+            </button>
+          </>
+        )}
+      </div>,
+      document.body,
+    )
+
   return (
     <div className="editor-filetree">
+      {menuPortal}
       <div className="editor-filetree-head">
         {onTogglePanel ? (
           <button
